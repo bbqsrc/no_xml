@@ -1,5 +1,6 @@
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "jsx")]
 pub mod jsx;
 
 use core::{
@@ -11,6 +12,20 @@ use core::{
 };
 
 use collections2::ListMut;
+
+#[cfg(not(feature = "std"))]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        ()
+    };
+}
+
+#[cfg(feature = "std")]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        println!($($arg)*)
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhiteSpace {
@@ -436,31 +451,31 @@ pub struct XmlVisitor;
 
 impl Visitor for XmlVisitor {
     fn start_tag(&mut self, name: &str) {
-        println!("Start: {}", name);
+        debug!("Start: {}", name);
     }
 
     fn self_closed_tag(&mut self, name: &str) {
-        println!("Self-closed: {name}");
+        debug!("Self-closed: {name}");
     }
 
     fn end_tag(&mut self, name: &str) {
-        println!("End: {name}");
+        debug!("End: {name}");
     }
 
     fn attribute(&mut self, key: &str, value: &str) {
-        println!("Attr: {key} => {value:?}")
+        debug!("Attr: {key} => {value:?}")
     }
 
     fn text(&mut self, text: &str) {
-        println!("Text: {:?}", text);
+        debug!("Text: {:?}", text);
     }
 
     fn comment(&mut self, text: &str) {
-        println!("Comment: {:?}", text);
+        debug!("Comment: {:?}", text);
     }
 
     fn entity(&mut self, entity: &str) {
-        println!("Entity: {:?}", entity);
+        debug!("Entity: {:?}", entity);
     }
 }
 
@@ -657,7 +672,6 @@ pub trait Visitor {
     fn entity(&mut self, entity: &str);
 }
 
-#[cfg(feature = "std")]
 pub fn stream_events<'s, S, V>(
     input: &'s str,
     visitor: &mut S::Visitor,
@@ -677,14 +691,14 @@ where
         buf = b;
         let (span, token) = item?;
 
-        // println!("Token: {:?} at {span}", token);
+        // debug!("Token: {:?} at {span}", token);
 
         if matches!(token, Token::Eof) {
-            // println!("EOF reached");
+            // debug!("EOF reached");
             break;
         }
 
-        // println!("[state:1] {state:?} {path:?}");
+        // debug!("[state:1] {state:?} {path:?}");
         state = non_standard_handler.process_state(
             span,
             token.clone(),
@@ -694,7 +708,7 @@ where
             input,
         );
 
-        // println!("[state:2] {state:?}");
+        // debug!("[state:2] {state:?}");
 
         if matches!(state_mode, StateMode::CData) {
             if let Token::Delim(Delim::CDataEnd) = token {
@@ -801,7 +815,7 @@ where
             //                 if matches!(token1, Token::Delim(Delim::CDataStart))
             //                     && matches!(token2, Token::Punc(Punc::TagEnd))
             //                 {
-            //                     // println!("CDATA start");
+            //                     // debug!("CDATA start");
             //                     state = State::None;
 
             //                 buf = b;
@@ -840,7 +854,7 @@ where
                     let name = path.pop().unwrap();
 
                     visitor.self_closed_tag(name);
-                    // println!("Self-closed tag: {}", name);
+                    // debug!("Self-closed tag: {}", name);
 
                     state = State::None;
                     continue;
@@ -872,7 +886,7 @@ where
                             );
                         }
 
-                        // println!("End tag: {}", name);
+                        // debug!("End tag: {}", name);
                         state = State::EndTagExpectingGt(name);
                     } else {
                         panic!("Tried to close emptiness");
@@ -893,7 +907,7 @@ where
                     state = State::AttrExpectingClosingQuote(key, value);
                 } else if matches!(token, Token::Punc(Punc::QuoteMark)) {
                     visitor.attribute(key, "");
-                    // println!("Attr: {key} => \"\"");
+                    // debug!("Attr: {key} => \"\"");
                     state = State::StartTagExpectingAttrs;
                 } else {
                     panic!("No value! {:?}", token);
@@ -909,7 +923,7 @@ where
             State::AttrExpectingClosingQuote(key, value) => {
                 if matches!(token, Token::Punc(Punc::QuoteMark)) {
                     visitor.attribute(key, value);
-                    // println!("Attr: {key} => {value:?}");
+                    // debug!("Attr: {key} => {value:?}");
                     state = State::StartTagExpectingAttrs;
                 } else {
                     panic!("Invalid attr, no quote");
@@ -951,10 +965,13 @@ where
         }
     }
 
-    println!("Done parsing XML");
+    debug!("Done parsing XML");
 
     Ok(())
 }
+
+#[cfg(not(feature = "std"))]
+type Vec<T> = heapless::Vec<T, 256>;
 
 #[cfg(test)]
 mod tests {
@@ -964,18 +981,18 @@ mod tests {
     #[test]
     fn test() {
         let mut x = Cursor::<'_, ()>::new("abcdefghijk");
-        println!("{:?}", x.peek_str());
+        debug!("{:?}", x.peek_str());
         x.buffer_char();
-        println!("{:?}", x.peek_str());
+        debug!("{:?}", x.peek_str());
         x.buffer_char();
-        println!("{:?}", x.peek_str());
+        debug!("{:?}", x.peek_str());
         x.consume();
-        println!("{:?}", x.peek_str());
+        debug!("{:?}", x.peek_str());
         x.buffer_char();
         x.buffer_char();
         x.buffer_char();
         x.buffer_char();
-        println!("{:?}", x.peek_str());
+        debug!("{:?}", x.peek_str());
 
         let xemel = "<root>
         <a thing=\"foo\" />< a ></
@@ -989,10 +1006,10 @@ mod tests {
     </root>AWOO";
 
         let x = Cursor::<'_, ()>::new(xemel);
-        println!("{:?}", x.into_iter().collect::<Result<Vec<_>, _>>());
+        debug!("{:?}", x.into_iter().collect::<Result<Vec<_>, _>>());
 
         stream_events::<(), Vec<&'_ str>>(xemel, &mut XmlVisitor).unwrap();
-        println!();
+        debug!();
         stream_events::<(), Vec<&'_ str>>("&#00a0;", &mut XmlVisitor).unwrap();
     }
 }

@@ -1,11 +1,17 @@
 [package]
 name = "no_xml"
+description = "A no_std XML streaming parser"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bbqsrc/no_xml"
+keywords = ["xml", "parser", "no_std", "streaming"]
 
 [dependencies]
-collections2 = { path = "../collections", default-features = false }
+collections2 = { git = "https://github.com/bbqsrc/collections", features = ["heapless"] }
+heapless = "0.9.1"
 
 [features]
 default = ["std"]
 std = ["collections2/std"]
+jsx = []
