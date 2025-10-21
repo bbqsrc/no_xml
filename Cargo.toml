@@ -1,0 +1,11 @@
+[package]
+name = "no_xml"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+collections2 = { path = "../collections", default-features = false }
+
+[features]
+default = ["std"]
+std = ["collections2/std"]
