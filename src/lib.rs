@@ -12,6 +12,9 @@ use core::{
 };
 
 use collections2::ListMut;
+use heapless::index_map::Values;
+
+const MAX_DOCTYPE_DEPTH: u8 = 6;
 
 #[cfg(not(feature = "std"))]
 macro_rules! debug {
@@ -23,7 +26,8 @@ macro_rules! debug {
 #[cfg(feature = "std")]
 macro_rules! debug {
     ($($arg:tt)*) => {
-        println!($($arg)*)
+        // println!($($arg)*)
+        ()
     };
 }
 
@@ -89,6 +93,8 @@ pub enum Punc {
     Dot,
     // Dash,
     Underscore,
+    LeftSquareBracket,
+    RightSquareBracket,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -97,6 +103,11 @@ pub enum Delim {
     CDataEnd,
     CommentStart,
     CommentEnd,
+    ProcessingInstructionStart,
+    ProcessingInstructionEnd,
+    Doctype,
+    Entity,
+    Element,
 }
 
 impl Delim {
@@ -106,6 +117,11 @@ impl Delim {
             Delim::CDataEnd => "]]>",
             Delim::CommentStart => "<!--",
             Delim::CommentEnd => "-->",
+            Delim::ProcessingInstructionStart => "<?",
+            Delim::ProcessingInstructionEnd => "?>",
+            Delim::Doctype => "<!DOCTYPE",
+            Delim::Entity => "<!ENTITY",
+            Delim::Element => "<!ELEMENT",
         }
     }
 }
@@ -128,6 +144,8 @@ impl Punc {
             Self::Underscore => "_",
             Self::Colon => ":",
             Self::Semicolon => ";",
+            Self::LeftSquareBracket => "[",
+            Self::RightSquareBracket => "]",
         }
     }
 }
@@ -152,6 +170,8 @@ impl TryFrom<&str> for Punc {
             "_" => Self::Underscore,
             ":" => Self::Colon,
             ";" => Self::Semicolon,
+            "[" => Self::LeftSquareBracket,
+            "]" => Self::RightSquareBracket,
 
             _ => return Err(()),
         })
@@ -182,20 +202,20 @@ where
     Delim(Delim),
     Text(&'t str),
     WhiteSpace(WhiteSpace),
-    Entity(&'t str),
+    EntityRef(&'t str),
 }
 
-impl<T> Token<'_, T>
+impl<'t, T> Token<'t, T>
 where
     T: NonStandardToken,
 {
-    fn to_text(&self) -> Option<&str> {
+    fn to_text(&self) -> Option<&'t str> {
         match self {
             Token::Punc(punc) => Some(punc.as_str()),
             Token::Text(t) => Some(*t),
             Token::WhiteSpace(ws) => Some(ws.as_str()),
-            Token::Entity(e) => Some(*e),
-            Token::Delim(_) => None,
+            Token::EntityRef(e) => Some(*e),
+            Token::Delim(delim) => Some(delim.as_str()),
             Token::NonStandard(_) => None,
             Token::Eof => None,
         }
@@ -248,10 +268,43 @@ impl Debug for Span {
 
 pub type Spanned<T> = (Span, T);
 
-#[derive(Debug)]
-pub enum Error {
-    // Utf8(core::str::Utf8Error),
+#[derive(Debug, Clone)]
+pub struct Error {
+    span: Span,
+    kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ErrorKind {
     UnexpectedEof,
+    MismatchedTag,
+    InvalidClosingTag,
+    InvalidAttributeSyntax,
+    InvalidEntity,
+    SelfClosingTagNotClosed,
+    UnexpectedToken,
+    TagNameExpected,
+    UnimplementedFeature,
+    DoctypeNestingTooDeep,
+}
+
+impl core::error::Error for Error {}
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.kind {
+            ErrorKind::UnexpectedEof => write!(f, "Unexpected end of file")?,
+            ErrorKind::MismatchedTag => write!(f, "Mismatched tag")?,
+            ErrorKind::InvalidClosingTag => write!(f, "Invalid closing tag")?,
+            ErrorKind::InvalidAttributeSyntax => write!(f, "Invalid attribute syntax")?,
+            ErrorKind::InvalidEntity => write!(f, "Invalid entity")?,
+            ErrorKind::SelfClosingTagNotClosed => write!(f, "Self-closing tag not closed")?,
+            ErrorKind::UnexpectedToken => write!(f, "Unexpected token")?,
+            ErrorKind::TagNameExpected => write!(f, "Tag name expected")?,
+            ErrorKind::UnimplementedFeature => write!(f, "Unimplemented feature")?,
+            ErrorKind::DoctypeNestingTooDeep => write!(f, "DOCTYPE nesting too deep")?,
+        }
+        write!(f, " ({})", self.span)
+    }
 }
 
 #[derive(Clone)]
@@ -374,7 +427,7 @@ where
 
     #[inline]
     fn buffer_chars(&mut self, count: usize) {
-        for i in 0..count {
+        for _ in 0..count {
             self.buffer_char();
         }
     }
@@ -425,20 +478,21 @@ where
     }
 
     #[inline]
-    fn with_span<T>(&self, input: T) -> Spanned<T> {
-        (self.span(), input)
+    fn with_span<T>(self, input: T) -> (Span, T, Cursor<'a, X>) {
+        (self.span(), input, self)
     }
 
     #[inline]
-    fn err_with_span<T, E>(self, err: E) -> (Result<T, Spanned<E>>, Self) {
-        let spanned = Err(self.with_span(err));
-        (spanned, self)
+    fn err_with_span<T>(self, err: ErrorKind) -> Result<T, Error> {
+        Err(Error {
+            span: self.span(),
+            kind: err,
+        })
     }
 
     #[inline]
-    fn ok_with_span<T, E>(self, ok: T) -> (Result<Spanned<T>, E>, Self) {
-        let spanned = Ok(self.with_span(ok));
-        (spanned, self)
+    fn ok_with_span<T>(self, ok: T) -> Result<(Span, T, Cursor<'a, X>), Error> {
+        Ok(self.with_span(ok))
     }
 
     #[inline]
@@ -450,32 +504,103 @@ where
 pub struct XmlVisitor;
 
 impl Visitor for XmlVisitor {
-    fn start_tag(&mut self, name: &str) {
+    fn start_tag(&mut self, name: &str) -> Result<(), Error> {
         debug!("Start: {}", name);
+        Ok(())
     }
 
-    fn self_closed_tag(&mut self, name: &str) {
-        debug!("Self-closed: {name}");
-    }
-
-    fn end_tag(&mut self, name: &str) {
+    fn end_tag(&mut self, name: &str) -> Result<(), Error> {
         debug!("End: {name}");
+        Ok(())
     }
 
-    fn attribute(&mut self, key: &str, value: &str) {
-        debug!("Attr: {key} => {value:?}")
+    fn attribute(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        debug!("Attr: {key} => {value:?}");
+        Ok(())
     }
 
-    fn text(&mut self, text: &str) {
+    fn text(&mut self, text: &str) -> Result<(), Error> {
         debug!("Text: {:?}", text);
+        Ok(())
     }
 
-    fn comment(&mut self, text: &str) {
+    fn comment(&mut self, text: &str) -> Result<(), Error> {
         debug!("Comment: {:?}", text);
+        Ok(())
     }
 
-    fn entity(&mut self, entity: &str) {
+    fn start_comment(&mut self) -> Result<(), Error> {
+        debug!("Start comment");
+        Ok(())
+    }
+
+    fn end_comment(&mut self) -> Result<(), Error> {
+        debug!("End comment");
+        Ok(())
+    }
+
+    fn entity_ref(&mut self, entity: &str) -> Result<(), Error> {
         debug!("Entity: {:?}", entity);
+        Ok(())
+    }
+
+    fn start_processing_instruction(&mut self) -> Result<(), Error> {
+        debug!("Start PI");
+        Ok(())
+    }
+
+    fn processing_instruction(&mut self, content: &str) -> Result<(), Error> {
+        debug!("Processing instruction: {}", content);
+        Ok(())
+    }
+
+    fn end_processing_instruction(&mut self) -> Result<(), Error> {
+        debug!("End PI");
+        Ok(())
+    }
+
+    fn start_doctype(&mut self) -> Result<(), Error> {
+        debug!("Start DOCTYPE");
+        Ok(())
+    }
+
+    fn doctype(&mut self, content: &str) -> Result<(), Error> {
+        debug!("DOCTYPE: {:?}", content);
+        Ok(())
+    }
+
+    fn end_doctype(&mut self) -> Result<(), Error> {
+        debug!("End DOCTYPE");
+        Ok(())
+    }
+
+    fn end_entity_declaration(&mut self) -> Result<(), Error> {
+        debug!("End ENTITY");
+        Ok(())
+    }
+
+    fn start_entity_declaration(&mut self) -> Result<(), Error> {
+        debug!("Start ENTITY");
+        Ok(())
+    }
+    fn entity_declaration(&mut self, content: &str) -> Result<(), Error> {
+        debug!("{}", content);
+        Ok(())
+    }
+
+    fn element_declaration(&mut self, _content: &str) -> Result<(), Error> {
+        debug!("ELEMENT {_content}");
+        Ok(())
+    }
+
+    fn end_element_declaration(&mut self) -> Result<(), Error> {
+        debug!("End ELEMENT");
+        Ok(())
+    }
+
+    fn start_element_declaration(&mut self) -> Result<(), Error> {
+        debug!("Start ELEMENT");
+        Ok(())
     }
 }
 
@@ -484,38 +609,28 @@ pub struct Iter<'t, T: NonStandardToken = ()> {
 }
 
 impl<'t, T: NonStandardToken> Iterator for Iter<'t, T> {
-    type Item = TokenResult<'t, T>;
+    type Item = (Span, Token<'t, T>, Cursor<'t, T>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(cursor) = self.cursor.take() {
-            let (x, buf) = tokenize::<T>(cursor);
-            match x {
-                Ok((_, Token::Eof)) | Err(_) => {}
-                _ => {
-                    self.cursor = Some(buf);
-                }
-            }
-            return Some(x);
-        }
+        let Some(cursor) = self.cursor.take() else {
+            return None;
+        };
 
-        None
+        match tokenize::<T>(cursor, StateMode::None) {
+            Err(_) | Ok((_, Token::Eof, _)) => None,
+            Ok(tup) => Some(tup),
+        }
     }
 }
 
-pub type TokenResult<'t, T = ()> = Result<Spanned<Token<'t, T>>, Spanned<Error>>;
+// pub type TokenResult<'t, T = ()> = Result<Spanned<Token<'t, T>>, Spanned<Error>>;
 pub type Maybe<T> = Option<Spanned<T>>;
 
-fn delim<'t, T: NonStandardToken>(base_buf: Cursor<'t, T>) -> (Maybe<Delim>, Cursor<'t, T>) {
+#[inline]
+fn delim_directive<'t, T: NonStandardToken>(
+    base_buf: Cursor<'t, T>,
+) -> (Maybe<Delim>, Cursor<'t, T>) {
     let mut buf = base_buf.clone();
-    buf.buffer_chars_up_to(3);
-    let cur = buf.peek_substr(3);
-
-    match cur {
-        "-->" => return (Some(buf.consume_with_span(Delim::CommentEnd)), buf),
-        "]]>" => return (Some(buf.consume_with_span(Delim::CDataEnd)), buf),
-
-        _ => {}
-    }
 
     buf.buffer_chars_up_to(4);
     let cur = buf.peek_substr(4);
@@ -524,17 +639,76 @@ fn delim<'t, T: NonStandardToken>(base_buf: Cursor<'t, T>) -> (Maybe<Delim>, Cur
         return (Some(buf.consume_with_span(Delim::CommentStart)), buf);
     }
 
+    buf.buffer_chars_up_to(8);
+    let cur = buf.peek_substr(8);
+
+    if cur == "<!ENTITY" {
+        return (Some(buf.consume_with_span(Delim::Entity)), buf);
+    }
+
     buf.buffer_chars_up_to(9);
     let cur = buf.peek_substr(9);
+
+    if cur == "<!DOCTYPE" {
+        return (Some(buf.consume_with_span(Delim::Doctype)), buf);
+    }
 
     if cur == "<![CDATA[" {
         return (Some(buf.consume_with_span(Delim::CDataStart)), buf);
     }
 
+    if cur == "<!ELEMENT" {
+        return (Some(buf.consume_with_span(Delim::Element)), buf);
+    }
+
+    return (None, base_buf);
+}
+
+fn delim<'t, T: NonStandardToken>(
+    base_buf: Cursor<'t, T>,
+    state_mode: StateMode,
+) -> (Maybe<Delim>, Cursor<'t, T>) {
+    let mut buf = base_buf.clone();
+    buf.buffer_chars_up_to(2);
+    let cur = buf.peek_substr(2);
+
+    match cur {
+        "<!" => return delim_directive(buf),
+        "<?" => {
+            return (
+                Some(buf.consume_with_span(Delim::ProcessingInstructionStart)),
+                buf,
+            );
+        }
+        "?>" => {
+            return (
+                Some(buf.consume_with_span(Delim::ProcessingInstructionEnd)),
+                buf,
+            );
+        }
+        _ => {}
+    }
+
+    buf.buffer_chars_up_to(3);
+    let cur = buf.peek_substr(3);
+
+    match cur {
+        "-->" => return (Some(buf.consume_with_span(Delim::CommentEnd)), buf),
+        // This is hacky, the tokenizer shouldn't need to be stateful
+        "]]>" if matches!(state_mode, StateMode::CData) => {
+            return (Some(buf.consume_with_span(Delim::CDataEnd)), buf);
+        }
+
+        _ => {}
+    }
+
     (None, base_buf)
 }
 
-fn tokenize<'t, T>(mut buf: Cursor<'t, T>) -> (TokenResult<'t, T>, Cursor<'t, T>)
+fn tokenize<'t, T>(
+    mut buf: Cursor<'t, T>,
+    state_mode: StateMode,
+) -> Result<(Span, Token<'t, T>, Cursor<'t, T>), Error>
 where
     T: NonStandardToken,
 {
@@ -546,24 +720,22 @@ where
                 || T::handle_char(ch).is_some()
             {
                 if let Some(non_standard) = T::handle_str(buf.peek_str()) {
-                    return (
-                        Ok(buf.consume_with_span(Token::NonStandard(non_standard))),
-                        buf,
-                    );
+                    let (span, token) = buf.consume_with_span(Token::NonStandard(non_standard));
+                    return Ok((span, token, buf));
                 }
 
                 let (span, s) = buf.consume_str();
-                return (Ok((span, Token::Text(s))), buf);
+                return Ok((span, Token::Text(s), buf));
             }
         } else {
             let (span, s) = buf.consume_str();
-            return (Ok((span, Token::Text(s))), buf);
+            return Ok((span, Token::Text(s), buf));
         }
     }
 
     if buf.buffer_char().is_none() {
         if !buf.is_empty() {
-            return buf.err_with_span(Error::UnexpectedEof);
+            return buf.err_with_span(ErrorKind::UnexpectedEof);
         }
 
         return buf.ok_with_span(Token::Eof);
@@ -572,25 +744,25 @@ where
     let ch = buf.peek_str().chars().next().unwrap();
     if let Ok(ws) = WhiteSpace::try_from(ch) {
         let span = buf.consume();
-        return (Ok((span, Token::WhiteSpace(ws))), buf);
+        return Ok((span, Token::WhiteSpace(ws), buf));
     }
 
-    let (delim, mut buf) = delim(buf);
+    let (delim, mut buf) = delim(buf, state_mode);
     if let Some((span, delim)) = delim {
-        return (Ok((span, Token::Delim(delim))), buf);
+        return Ok((span, Token::Delim(delim), buf));
     }
 
     if let Ok(punc) = Punc::try_from(buf.peek_str()) {
         let span = buf.consume();
-        return (Ok((span, Token::Punc(punc))), buf);
+        return Ok((span, Token::Punc(punc), buf));
     }
 
     if let Some(non_standard) = T::handle_char(ch) {
         let span = buf.consume();
-        return (Ok((span, Token::NonStandard(non_standard))), buf);
+        return Ok((span, Token::NonStandard(non_standard), buf));
     }
 
-    tokenize(buf)
+    tokenize(buf, state_mode)
 }
 
 pub enum Event<'e> {
@@ -611,14 +783,16 @@ where
     StartTagExpectingGt,
     EndTagExpectingName,
     EndTagExpectingGt(&'s str),
-    AttrExpectingEqOrNamespace(&'s str),
+    AttrExpectingEqOrNamespace(&'s str, Position),
+    AttrExpectingNamespaceLocalName(&'s str, Position),
     AttrExpectingOpeningQuote(&'s str),
-    AttrExpectingValue(&'s str),
-    AttrExpectingClosingQuote(&'s str, &'s str),
-    EntityExpectingValue,
-    EntityExpectingNumerals,
-    EntityExpectingSemicolon(&'s str),
-    // DeclExpectingName,
+    AttrExpectingValue(&'s str, Position),
+    AttrExpectingClosingQuote(&'s str, Position),
+    EntityRefExpectingValue(Position),
+    EntityRefExpectingNumerals(Position),
+    EntityRefExpectingSemicolon(Position),
+    EntityDeclExpectingContent,
+    ElementDeclExpectingContent,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -626,72 +800,187 @@ pub enum StateMode {
     None,
     CData,
     Comment,
+    ProcessingInstruction,
+    Doctype,
+    DoctypeInner(u8),
 }
 
-pub trait NonStandardEventHandler<'s>: Default + Copy {
+// pub trait NonStandardEventHandler<'s>: Default + Copy {
+//     type Token: NonStandardToken;
+//     type State: Debug + Copy;
+//     type Visitor: Visitor;
+
+//     fn process_state(
+//         &mut self,
+//         span: Span,
+//         token: Token<'s, Self::Token>,
+//         state: State<'s, Self::State>,
+//         path: &mut impl ListMut<&'s str>,
+//         visitor: &mut Self::Visitor,
+//         raw_input: &'s str,
+//     ) -> Result<State<'s, Self::State>, Error>;
+// }
+
+// impl<'s> NonStandardEventHandler<'s> for () {
+//     type Token = ();
+//     type State = ();
+//     type Visitor = XmlVisitor;
+
+//     fn process_state(
+//         &mut self,
+//         _span: Span,
+//         _token: Token<'s, Self::Token>,
+//         state: State<'s, Self::State>,
+//         _path: &mut impl ListMut<&'s str>,
+//         _visitor: &mut Self::Visitor,
+//         _raw_input: &'s str,
+//     ) -> Result<State<'s, Self::State>, Error> {
+//         Ok(state)
+//     }
+// }
+
+pub trait Parser<V: Visitor>: Default {
     type Token: NonStandardToken;
-    type State: Debug + Copy;
-    type Visitor: Visitor;
+    type State<'s>: Debug + Copy;
 
-    fn process_state(
-        &mut self,
-        span: Span,
-        token: Token<'s, Self::Token>,
-        state: State<'s, Self::State>,
-        path: &mut impl ListMut<&'s str>,
-        visitor: &mut Self::Visitor,
-        raw_input: &'s str,
-    ) -> State<'s, Self::State>;
-}
-
-impl<'s> NonStandardEventHandler<'s> for () {
-    type Token = ();
-    type State = ();
-    type Visitor = XmlVisitor;
-
-    fn process_state(
+    fn process_state<'s>(
         &mut self,
         _span: Span,
         _token: Token<'s, Self::Token>,
-        state: State<'s, Self::State>,
+        state: State<'s, Self::State<'s>>,
         _path: &mut impl ListMut<&'s str>,
-        _visitor: &mut Self::Visitor,
+        _visitor: &mut V,
         _raw_input: &'s str,
-    ) -> State<'s, Self::State> {
-        state
+    ) -> Result<State<'s, Self::State<'s>>, Error> {
+        Ok(state)
     }
 }
 
-pub trait Visitor {
-    fn start_tag(&mut self, name: &str);
-    fn self_closed_tag(&mut self, name: &str);
-    fn end_tag(&mut self, name: &str);
-    fn attribute(&mut self, key: &str, value: &str);
-    fn text(&mut self, text: &str);
-    fn comment(&mut self, text: &str);
-    fn entity(&mut self, entity: &str);
+#[derive(Debug, Default)]
+pub struct XmlParser;
+
+impl<V: Visitor> Parser<V> for XmlParser {
+    type Token = ();
+    type State<'s> = ();
 }
 
-pub fn stream_events<'s, S, V>(
-    input: &'s str,
-    visitor: &mut S::Visitor,
-) -> Result<(), Spanned<Error>>
+pub trait Visitor {
+    fn start_tag(&mut self, _name: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_tag(&mut self, _name: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn attribute(&mut self, _key: &str, _value: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn text(&mut self, _text: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn comment(&mut self, _text: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_comment(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_comment(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn entity_ref(&mut self, _entity_ref: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_processing_instruction(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn processing_instruction(&mut self, _content: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_processing_instruction(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_doctype(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn doctype(&mut self, _content: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_doctype(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_entity_declaration(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_entity_declaration(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn entity_declaration(&mut self, _content: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_element_declaration(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_element_declaration(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn element_declaration(&mut self, _content: &str) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+fn parse_doctype_header(content: &str) -> (Option<&str>, Option<&str>) {
+    let content = content.trim();
+    if content.is_empty() {
+        return (None, None);
+    }
+
+    let mut parts = content.splitn(2, |c: char| c.is_whitespace());
+    let name = parts.next().filter(|s| !s.is_empty());
+    let external_id = parts
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim());
+
+    (name, external_id)
+}
+
+fn split_doctype_content(full_content: &str, subset_offset: usize) -> (&str, &str) {
+    let header_end = subset_offset.saturating_sub(1);
+    let header = full_content[..header_end].trim();
+
+    let subset_start = subset_offset;
+    let subset_content = &full_content[subset_start..];
+
+    if let Some(end_bracket) = subset_content.rfind(']') {
+        let internal_subset = subset_content[..end_bracket].trim();
+        (header, internal_subset)
+    } else {
+        (header, subset_content.trim())
+    }
+}
+
+pub fn stream_xml_events<'s, L>(input: &'s str, visitor: &mut impl Visitor) -> Result<(), Error>
 where
-    S: NonStandardEventHandler<'s>,
-    V: ListMut<&'s str> + Default + Debug,
+    L: ListMut<&'s str> + Default + Debug,
 {
-    let mut buf = Cursor::<'_, S::Token>::new(input);
-    let mut path = V::default();
-    let mut state: State<S::State> = State::None;
+    stream_events::<L, XmlParser, _>(input, visitor)
+}
+
+pub fn stream_events<'s, L, P, V>(input: &'s str, visitor: &mut V) -> Result<(), Error>
+where
+    V: Visitor,
+    P: Parser<V> + Default,
+    L: ListMut<&'s str> + Default + Debug,
+{
+    let mut buf = Cursor::<'_, P::Token>::new(input);
+    let mut path = L::default();
+    let mut state: State<P::State<'s>> = State::None;
     let mut state_mode = StateMode::None;
-    let mut non_standard_handler = S::default();
+    let mut parser = P::default();
 
     loop {
-        let (item, b) = tokenize(buf);
+        let (span, token, b) = tokenize(buf, state_mode)?;
+        // println!("Token: {:?} at {span}", token);
         buf = b;
-        let (span, token) = item?;
-
-        // debug!("Token: {:?} at {span}", token);
 
         if matches!(token, Token::Eof) {
             // debug!("EOF reached");
@@ -699,16 +988,55 @@ where
         }
 
         // debug!("[state:1] {state:?} {path:?}");
-        state = non_standard_handler.process_state(
-            span,
-            token.clone(),
-            state,
-            &mut path,
-            visitor,
-            input,
-        );
+        state = parser.process_state(span, token.clone(), state, &mut path, visitor, input)?;
 
         // debug!("[state:2] {state:?}");
+
+        if matches!(state_mode, StateMode::Doctype) {
+            if matches!(token, Token::Punc(Punc::TagEnd)) {
+                visitor.end_doctype()?;
+                state_mode = StateMode::None;
+                continue;
+            }
+
+            if matches!(token, Token::Punc(Punc::LeftSquareBracket)) {
+                state_mode = StateMode::DoctypeInner(0);
+                continue;
+            }
+
+            if matches!(token, Token::WhiteSpace(_)) {
+                continue;
+            }
+
+            if let Some(content) = token.to_text() {
+                visitor.doctype(content)?;
+            } else {
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+
+            continue;
+        }
+
+        if let StateMode::DoctypeInner(depth) = state_mode {
+            if matches!(token, Token::Punc(Punc::RightSquareBracket)) {
+                if depth == 0 {
+                    state_mode = StateMode::Doctype;
+                } else {
+                    state_mode = StateMode::DoctypeInner(depth - 1);
+                }
+
+                continue;
+            }
+
+            if matches!(token, Token::WhiteSpace(_)) {
+                continue;
+            }
+
+            // Fall through
+        }
 
         if matches!(state_mode, StateMode::CData) {
             if let Token::Delim(Delim::CDataEnd) = token {
@@ -717,9 +1045,12 @@ where
             }
 
             if let Some(text) = token.to_text() {
-                visitor.text(text);
+                visitor.text(text)?;
             } else {
-                panic!("Invalid token in CDATA: {:?}", token);
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
             }
 
             continue;
@@ -727,11 +1058,36 @@ where
 
         if matches!(state_mode, StateMode::Comment) {
             if let Token::Delim(Delim::CommentEnd) = token {
+                visitor.end_comment()?;
                 state_mode = StateMode::None;
-            } else if let Token::Text(text) = token {
-                visitor.comment(text);
+            }
+
+            if let Some(text) = token.to_text() {
+                visitor.comment(text)?;
             } else {
-                panic!("Invalid token in Comment: {:?}", token);
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+
+            continue;
+        }
+
+        if matches!(state_mode, StateMode::ProcessingInstruction) {
+            if let Token::Delim(Delim::ProcessingInstructionEnd) = token {
+                visitor.end_processing_instruction()?;
+                state_mode = StateMode::None;
+                continue;
+            }
+
+            if let Some(text) = token.to_text() {
+                visitor.processing_instruction(text)?;
+            } else {
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
             }
 
             continue;
@@ -741,13 +1097,12 @@ where
             State::NonStandard(_) => { /* Always a no-op */ }
             State::None => {
                 if matches!(token, Token::Punc(Punc::Ampersand)) {
-                    state = State::EntityExpectingValue;
+                    state = State::EntityRefExpectingValue(span.end);
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::TagStart)) {
-                    let (item, _) = tokenize(buf.clone());
-                    let (_, token2) = item?;
+                    let (_, token2, _) = tokenize(buf.clone(), state_mode)?;
 
                     if matches!(token2, Token::Punc(Punc::Slash)) {
                         state = State::EndTagExpectingName;
@@ -759,82 +1114,77 @@ where
                 }
 
                 match token {
-                    Token::NonStandard(_) => todo!("non-standard"),
-                    Token::Eof => todo!("eof"),
-                    Token::Punc(punc) => visitor.text(punc.as_str()),
+                    Token::NonStandard(_) => {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::UnexpectedToken,
+                        });
+                    }
+                    Token::Eof => {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::UnexpectedEof,
+                        });
+                    }
+                    Token::Punc(punc) => visitor.text(punc.as_str())?,
                     Token::Delim(val) => match val {
                         Delim::CDataStart => {
                             state_mode = StateMode::CData;
                             continue;
                         }
-                        Delim::CDataEnd => {}
-                        Delim::CommentStart => {}
-                        Delim::CommentEnd => {}
+                        Delim::CommentStart => {
+                            state_mode = StateMode::Comment;
+                            visitor.start_comment()?;
+                            continue;
+                        }
+                        Delim::ProcessingInstructionStart => {
+                            state_mode = StateMode::ProcessingInstruction;
+                            visitor.start_processing_instruction()?;
+                            continue;
+                        }
+                        Delim::Doctype => {
+                            state_mode = StateMode::Doctype;
+                            visitor.start_doctype()?;
+                            continue;
+                        }
+                        Delim::Entity => {
+                            state = State::EntityDeclExpectingContent;
+                            visitor.start_entity_declaration()?;
+                            continue;
+                        }
+                        Delim::Element => {
+                            state = State::ElementDeclExpectingContent;
+                            visitor.start_element_declaration()?;
+                            continue;
+                        }
+                        _ => {}
                     },
-                    Token::Text(text) => visitor.text(text),
-                    Token::WhiteSpace(ws) => visitor.text(ws.as_str()),
-                    Token::Entity(_) => todo!("entity"),
+                    Token::Text(text) => visitor.text(text)?,
+                    Token::WhiteSpace(ws) => visitor.text(ws.as_str())?,
+                    Token::EntityRef(entity) => visitor.entity_ref(entity)?,
                 }
+
+                continue;
             }
             State::StartTagExpectingName => {
                 if matches!(token, Token::WhiteSpace(_)) {
                     continue;
                 }
 
-                // if matches!(token, Token::Punc(Punc::ExclamationMark)) {
-                //     state = State::DeclExpectingName;
-                //     continue;
-                // }
-
-                if let Token::Text(name) = token {
+                if let Some(name) = token.to_text() {
                     path.push(name);
 
-                    visitor.start_tag(name);
+                    visitor.start_tag(name)?;
 
                     state = State::StartTagExpectingAttrs;
                     continue;
                 }
 
-                panic!("Name not found! {:?}", token);
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::TagNameExpected,
+                });
             }
-            // State::DeclExpectingName => {
-            //     if matches!(token, Token::WhiteSpace(_)) {
-            //         continue;
-            //     }
-
-            //     if let Token::Text(decl) = token {
-            //         match decl {
-            //             "CDATA" => {
-
-            //                 let (item, b) = tokenize(buf);
-            //                 let (_span, token1) = item?;
-
-            //                 let (item2, b) = tokenize(b);
-            //                 let (_span, token2) = item2?;
-
-            //                 if matches!(token1, Token::Delim(Delim::CDataStart))
-            //                     && matches!(token2, Token::Punc(Punc::TagEnd))
-            //                 {
-            //                     // debug!("CDATA start");
-            //                     state = State::None;
-
-            //                 buf = b;
-            //                 continue;
-            //             }
-            //             decl => {
-            //                 panic!("Unknown decl type: {:?}", decl);
-            //             }
-            //         }
-            //         // path.push(name);
-
-            //         // visitor.start_tag(name);
-
-            //         state = State::StartTagExpectingAttrs;
-            //         continue;
-            //     }
-
-            //     panic!("Decl name not found! {:?}", token);
-            // }
             State::StartTagExpectingAttrs => {
                 if matches!(token, Token::Punc(Punc::Slash)) {
                     state = State::StartTagExpectingGt;
@@ -846,30 +1196,35 @@ where
                 }
 
                 if let Token::Text(text) = token {
-                    state = State::AttrExpectingEqOrNamespace(text);
+                    state = State::AttrExpectingEqOrNamespace(text, span.start);
                 }
             }
             State::StartTagExpectingGt => {
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     let name = path.pop().unwrap();
 
-                    visitor.self_closed_tag(name);
-                    // debug!("Self-closed tag: {}", name);
+                    visitor.end_tag(name)?;
 
                     state = State::None;
                     continue;
                 } else {
-                    panic!("Self-closing tag did not close properly");
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::SelfClosingTagNotClosed,
+                    });
                 }
             }
             State::EndTagExpectingGt(name) => {
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
-                    visitor.end_tag(name);
+                    visitor.end_tag(name)?;
 
                     state = State::None;
                     continue;
                 } else {
-                    panic!("Self-closing tag did not close properly");
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedToken,
+                    });
                 }
             }
             State::EndTagExpectingName => {
@@ -880,92 +1235,138 @@ where
                 if let Token::Text(name) = token {
                     if let Some(tag) = path.pop() {
                         if tag != name {
-                            panic!(
-                                "Invalid closing tag. Encountered: {:?}, expected: {:?}",
-                                tag, name
-                            );
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::MismatchedTag,
+                            });
                         }
 
                         // debug!("End tag: {}", name);
                         state = State::EndTagExpectingGt(name);
                     } else {
-                        panic!("Tried to close emptiness");
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidClosingTag,
+                        });
                     }
                 }
             }
-            State::AttrExpectingEqOrNamespace(key) => {
+            State::AttrExpectingEqOrNamespace(key, key_start) => {
                 if matches!(token, Token::Punc(Punc::Equals)) {
                     state = State::AttrExpectingOpeningQuote(key);
                 } else if matches!(token, Token::Punc(Punc::Colon)) {
-                    panic!("Namespace support incomplete");
+                    state = State::AttrExpectingNamespaceLocalName(key, key_start);
                 } else {
-                    panic!("No equals for attr")
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidAttributeSyntax,
+                    });
                 }
             }
-            State::AttrExpectingValue(key) => {
-                if let Token::Text(value) = token {
-                    state = State::AttrExpectingClosingQuote(key, value);
-                } else if matches!(token, Token::Punc(Punc::QuoteMark)) {
-                    visitor.attribute(key, "");
-                    // debug!("Attr: {key} => \"\"");
+            State::AttrExpectingNamespaceLocalName(_prefix, prefix_start) => {
+                if let Token::Text(_local_name) = token {
+                    let full_name = &input[prefix_start.index..span.end.index];
+                    state = State::AttrExpectingEqOrNamespace(full_name, prefix_start);
+                } else {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidAttributeSyntax,
+                    });
+                }
+            }
+            State::AttrExpectingValue(key, start_pos) => {
+                if matches!(token, Token::Punc(Punc::QuoteMark)) {
+                    let value = &input[start_pos.index..span.start.index];
+                    visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
                 } else {
-                    panic!("No value! {:?}", token);
+                    state = State::AttrExpectingClosingQuote(key, start_pos);
                 }
             }
             State::AttrExpectingOpeningQuote(key) => {
                 if matches!(token, Token::Punc(Punc::QuoteMark)) {
-                    state = State::AttrExpectingValue(key);
+                    state = State::AttrExpectingValue(key, span.end);
                 } else {
-                    panic!("Invalid attr, no quote");
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidAttributeSyntax,
+                    });
                 }
             }
-            State::AttrExpectingClosingQuote(key, value) => {
+            State::AttrExpectingClosingQuote(key, start_pos) => {
                 if matches!(token, Token::Punc(Punc::QuoteMark)) {
-                    visitor.attribute(key, value);
-                    // debug!("Attr: {key} => {value:?}");
+                    let value = &input[start_pos.index..span.start.index];
+                    visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
-                } else {
-                    panic!("Invalid attr, no quote");
                 }
             }
-            State::EntityExpectingValue => match token {
-                Token::NonStandard(_) => todo!("non-standard"),
-                Token::Eof => todo!("eof"),
-                Token::Punc(Punc::NumberSign) => {
-                    state = State::EntityExpectingNumerals;
-                }
-                Token::Punc(punc) => todo!("unepxected punc: {punc:?}"),
-                Token::Delim(_) => todo!("delim {state:?}"),
-                Token::Text(text) => {
-                    state = State::EntityExpectingSemicolon(text);
-                }
-                Token::WhiteSpace(_) => todo!("whitespace"),
-                Token::Entity(_) => todo!("entity"),
-            },
-            State::EntityExpectingNumerals => match token {
-                Token::NonStandard(_) => todo!("non-standard"),
-                Token::Eof => todo!("eof"),
-                Token::Punc(punc) => todo!("unepxected punc: {punc:?}"),
-                Token::Delim(_) => todo!("delim {state:?}"),
-                Token::Text(text) => {
-                    state = State::EntityExpectingSemicolon(text);
-                }
-                Token::WhiteSpace(_) => todo!("whitespace"),
-                Token::Entity(_) => todo!("entity"),
-            },
-            State::EntityExpectingSemicolon(value) => {
-                if matches!(token, Token::Punc(Punc::Semicolon)) {
-                    visitor.entity(value);
+            State::EntityRefExpectingValue(start_pos) => {
+                if matches!(token, Token::Punc(Punc::NumberSign)) {
+                    state = State::EntityRefExpectingNumerals(start_pos);
+                } else if matches!(token, Token::Punc(Punc::Semicolon)) {
+                    let entity_name = &input[start_pos.index..span.start.index];
+                    visitor.entity_ref(entity_name)?;
                     state = State::None;
+                } else if matches!(token, Token::Eof) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedEof,
+                    });
                 } else {
-                    panic!("Invalid entity!")
+                    state = State::EntityRefExpectingSemicolon(start_pos);
+                }
+            }
+            State::EntityRefExpectingNumerals(start_pos) => {
+                if matches!(token, Token::Punc(Punc::Semicolon)) {
+                    let entity_value = &input[start_pos.index..span.start.index];
+                    visitor.entity_ref(entity_value)?;
+                    state = State::None;
+                } else if matches!(token, Token::Eof) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedEof,
+                    });
+                } else {
+                    state = State::EntityRefExpectingSemicolon(start_pos);
+                }
+            }
+            State::EntityRefExpectingSemicolon(start_pos) => {
+                if matches!(token, Token::Punc(Punc::Semicolon)) {
+                    let entity_name = &input[start_pos.index..span.start.index];
+                    visitor.entity_ref(entity_name)?;
+                    state = State::None;
+                }
+            }
+            State::EntityDeclExpectingContent => {
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    visitor.end_entity_declaration()?;
+                    continue;
+                }
+
+                if let Some(value) = token.to_text() {
+                    visitor.entity_declaration(value)?;
+                    continue;
+                }
+            }
+            State::ElementDeclExpectingContent => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    visitor.end_element_declaration()?;
+                    continue;
+                }
+
+                if let Some(value) = token.to_text() {
+                    visitor.element_declaration(value)?;
+                    continue;
                 }
             }
         }
     }
-
-    debug!("Done parsing XML");
 
     Ok(())
 }
@@ -1006,10 +1407,204 @@ mod tests {
     </root>AWOO";
 
         let x = Cursor::<'_, ()>::new(xemel);
-        debug!("{:?}", x.into_iter().collect::<Result<Vec<_>, _>>());
+        debug!("{:?}", x.into_iter().collect::<Vec<_>>());
 
-        stream_events::<(), Vec<&'_ str>>(xemel, &mut XmlVisitor).unwrap();
+        stream_xml_events::<Vec<&'_ str>>(xemel, &mut XmlVisitor).unwrap();
         debug!();
-        stream_events::<(), Vec<&'_ str>>("&#00a0;", &mut XmlVisitor).unwrap();
+        stream_xml_events::<Vec<&'_ str>>("&#00a0;", &mut XmlVisitor).unwrap();
+    }
+
+    #[test]
+    fn test_entities() {
+        // Test named entities
+        stream_xml_events::<Vec<&'_ str>>("<root>&amp;&lt;&gt;&quot;</root>", &mut XmlVisitor)
+            .unwrap();
+
+        // Test numeric entities (decimal)
+        stream_xml_events::<Vec<&'_ str>>("<root>&#65;&#66;&#67;</root>", &mut XmlVisitor).unwrap();
+
+        // Test numeric entities (hexadecimal)
+        stream_xml_events::<Vec<&'_ str>>("<root>&#x41;&#x42;&#x43;</root>", &mut XmlVisitor)
+            .unwrap();
+
+        // Test mixed entities and text
+        stream_xml_events::<Vec<&'_ str>>(
+            "<root>Hello &amp; goodbye &lt;world&gt;</root>",
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test multiple consecutive entities
+        stream_xml_events::<Vec<&'_ str>>("<root>&amp;&amp;&amp;</root>", &mut XmlVisitor).unwrap();
+
+        // Test entity between tags (no content)
+        stream_xml_events::<Vec<&'_ str>>("<a></a>&amp;<b></b>", &mut XmlVisitor).unwrap();
+
+        // Test entities with whitespace
+        stream_xml_events::<Vec<&'_ str>>("<root> &amp; &lt; </root>", &mut XmlVisitor).unwrap();
+    }
+
+    #[test]
+    fn test_processing_instructions() {
+        // Test XML declaration
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test simple PI
+        stream_xml_events::<Vec<&'_ str>>("<?target some data?><root/>", &mut XmlVisitor).unwrap();
+
+        // Test PI with no data
+        stream_xml_events::<Vec<&'_ str>>("<?target?><root/>", &mut XmlVisitor).unwrap();
+
+        // Test PI after root element
+        stream_xml_events::<Vec<&'_ str>>("<root/><?target data?>", &mut XmlVisitor).unwrap();
+
+        // Test multiple PIs
+        stream_xml_events::<Vec<&'_ str>>(
+            "<?xml version=\"1.0\"?><?stylesheet href=\"style.css\"?><root/>",
+            &mut XmlVisitor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_doctype() {
+        // Test simple DOCTYPE
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE html SYSTEM "blah.dtd" [ <!ENTITY foo "bar"> ] ><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_various_doctype_formats() {
+        // Test DOCTYPE with SYSTEM
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root SYSTEM "foo.dtd"><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE with PUBLIC
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE before XML declaration (invalid but should parse)
+        stream_xml_events::<Vec<&'_ str>>("<!DOCTYPE root><root/>", &mut XmlVisitor).unwrap();
+
+        // Test DOCTYPE with internal subset
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [<!ENTITY foo "bar">]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE with SYSTEM and internal subset (user's example)
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE TESTSUITE SYSTEM "testcases.dtd" [
+                <!ENTITY % all "INCLUDE">
+                <!ENTITY % dbnotn SYSTEM "dbnotn.mod">
+                <!ENTITY % dbcent SYSTEM "dbcent.mod">
+                <!ENTITY % dbpool SYSTEM "dbpool.mod">
+                <!ENTITY % dbhier SYSTEM "dbhier.mod">
+                <!ENTITY % dbgenent SYSTEM "dbgenent.mod">
+            ]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE with nested brackets (depth 2)
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [<!ELEMENT test [nested]>]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE with multiple levels of nesting (depth 3)
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [<!ELEMENT test [level2 [level3]]>]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_depth_limit_doctype() {
+        // Test that exceeding MAX_DOCTYPE_DEPTH (6) returns an error
+        let result = stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [[[[[[[deep]]]]]]]><root/>"#,
+            &mut XmlVisitor,
+        );
+
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(matches!(err.kind, ErrorKind::DoctypeNestingTooDeep));
+        }
+    }
+
+    #[test]
+    fn test_mixed_features() {
+        // Test DOCTYPE + PI + elements + entities
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<?xml version="1.0"?><!DOCTYPE root><root attr="val">&amp;<child/></root>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_entity_declaration() {
+        // Test simple entity declaration
+        stream_xml_events::<Vec<&'_ str>>(r#"<!ENTITY foo "bar"><root/>"#, &mut XmlVisitor)
+            .unwrap();
+
+        // Test entity declaration with single quotes
+        stream_xml_events::<Vec<&'_ str>>(r#"<!ENTITY nbsp '&#160;'><root/>"#, &mut XmlVisitor)
+            .unwrap();
+
+        // Test multiple entity declarations
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!ENTITY foo "bar"><!ENTITY baz "qux"><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_entity_declaration_in_doctype() {
+        // Test entity declaration inside DOCTYPE internal subset
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [<!ENTITY foo "bar">]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test multiple entity declarations in DOCTYPE
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE root [
+                <!ENTITY foo "bar">
+                <!ENTITY nbsp "&#160;">
+                <!ENTITY copy "&#169;">
+            ]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
+
+        // Test DOCTYPE with SYSTEM and entity declarations
+        stream_xml_events::<Vec<&'_ str>>(
+            r#"<!DOCTYPE TESTSUITE SYSTEM "testcases.dtd" [
+                <!ENTITY % all "INCLUDE">
+                <!ENTITY % dbnotn "dbnotn.mod">
+            ]><root/>"#,
+            &mut XmlVisitor,
+        )
+        .unwrap();
     }
 }

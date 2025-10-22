@@ -1,8 +1,9 @@
+use core::fmt::Debug;
 use core::marker::PhantomData;
 
 use collections2::ListMut;
 
-use crate::{NonStandardEventHandler, NonStandardToken, Punc, Span, State, Token, Visitor};
+use crate::{Error, ErrorKind, NonStandardToken, Parser, Punc, Span, State, Token, Visitor};
 
 #[derive(Debug, Clone, Copy)]
 pub enum JsxState<'s> {
@@ -17,7 +18,7 @@ impl<'s> From<JsxState<'s>> for State<'s, JsxState<'s>> {
 }
 
 #[derive(Default, Debug, Clone, Copy)]
-pub struct JsxHandler<'s> {
+pub struct JsxParser<'s> {
     paren_count: usize,
     _data: PhantomData<&'s ()>,
 }
@@ -31,7 +32,51 @@ impl JsxVisitor {
     pub fn new() -> Self {
         Default::default()
     }
+}
 
+impl Visitor for JsxVisitor {
+    fn start_tag(&mut self, name: &str) -> Result<(), Error> {
+        println!("Start: {}", name);
+        Ok(())
+    }
+
+    fn end_tag(&mut self, name: &str) -> Result<(), Error> {
+        println!("End: {name}");
+        Ok(())
+    }
+
+    fn attribute(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        println!("Attr: {key} => {value:?}");
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), Error> {
+        println!("Text: {:?}", text);
+        Ok(())
+    }
+
+    fn comment(&mut self, text: &str) -> Result<(), Error> {
+        println!("Comment: {:?}", text);
+        Ok(())
+    }
+
+    fn start_comment(&mut self) -> Result<(), Error> {
+        println!("Start comment");
+        Ok(())
+    }
+
+    fn end_comment(&mut self) -> Result<(), Error> {
+        println!("End comment");
+        Ok(())
+    }
+
+    fn entity(&mut self, entity: &str) -> Result<(), Error> {
+        println!("Entity: {:?}", entity);
+        Ok(())
+    }
+}
+
+impl JsxVisitor {
     fn start_fragment(&mut self) {
         println!("Start fragment");
     }
@@ -57,62 +102,31 @@ impl JsxVisitor {
     }
 }
 
-impl Visitor for JsxVisitor {
-    fn start_tag(&mut self, name: &str) {
-        println!("Start: {}", name);
-    }
-
-    fn self_closed_tag(&mut self, name: &str) {
-        println!("Self-closed: {name}");
-    }
-
-    fn end_tag(&mut self, name: &str) {
-        println!("End: {name}");
-    }
-
-    fn attribute(&mut self, key: &str, value: &str) {
-        println!("Attr: {key} => {value:?}")
-    }
-
-    fn text(&mut self, text: &str) {
-        println!("Text: {:?}", text);
-    }
-
-    fn comment(&mut self, text: &str) {
-        println!("Comment: {:?}", text);
-    }
-
-    fn entity(&mut self, entity: &str) {
-        println!("Entity: {:?}", entity);
-    }
-}
-
-impl<'s> NonStandardEventHandler<'s> for JsxHandler<'s> {
+impl Parser<JsxVisitor> for JsxParser<'_> {
     type Token = JsxToken;
-    type State = JsxState<'s>;
-    type Visitor = JsxVisitor;
+    type State<'s> = JsxState<'s>;
 
-    fn process_state(
+    fn process_state<'s>(
         &mut self,
         span: Span,
         token: Token<'s, Self::Token>,
-        state: State<'s, Self::State>,
+        state: State<'s, Self::State<'s>>,
         path: &mut impl ListMut<&'s str>,
-        visitor: &mut Self::Visitor,
+        visitor: &mut JsxVisitor,
         raw_input: &'s str,
-    ) -> State<'s, Self::State> {
+    ) -> Result<State<'s, Self::State<'s>>, Error> {
         // This is a skip state.
         if matches!(state, State::NonStandard(JsxState::None)) {
-            return State::None;
+            return Ok(State::None);
         }
 
         if matches!(state, State::StartTagExpectingName) {
             if matches!(token, Token::Punc(Punc::TagEnd)) {
                 visitor.start_fragment();
                 path.push("#fragment");
-                return JsxState::None.into();
+                return Ok(JsxState::None.into());
             } else {
-                return State::StartTagExpectingName;
+                return Ok(State::StartTagExpectingName);
             }
         }
 
@@ -120,12 +134,15 @@ impl<'s> NonStandardEventHandler<'s> for JsxHandler<'s> {
             if matches!(token, Token::Punc(Punc::TagEnd)) {
                 let leaf = path.pop().expect("Overpopped the path!");
                 if leaf != "#fragment" {
-                    panic!("Unmatched fragment, got: {:?}", leaf);
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::MismatchedTag,
+                    });
                 }
                 visitor.end_fragment();
-                return JsxState::None.into();
+                return Ok(JsxState::None.into());
             } else {
-                return State::EndTagExpectingName;
+                return Ok(State::EndTagExpectingName);
             }
         }
 
@@ -133,7 +150,7 @@ impl<'s> NonStandardEventHandler<'s> for JsxHandler<'s> {
             if matches!(token, Token::NonStandard(JsxToken::LeftParen)) {
                 self.paren_count += 1;
                 visitor.start_expr(span, key);
-                return State::NonStandard(JsxState::ExpectingExpr(key));
+                return Ok(State::NonStandard(JsxState::ExpectingExpr(key)));
             }
         }
 
@@ -145,14 +162,14 @@ impl<'s> NonStandardEventHandler<'s> for JsxHandler<'s> {
 
                 if self.paren_count == 0 {
                     visitor.end_expr(span, key, raw_input);
-                    return State::StartTagExpectingAttrs;
+                    return Ok(State::StartTagExpectingAttrs);
                 }
             }
 
-            return state;
+            return Ok(state);
         }
 
-        state
+        Ok(state)
     }
 }
 
@@ -206,10 +223,10 @@ mod tests {
     </root></>AWOO";
 
         let x = Cursor::<'_, JsxToken>::new(xemel);
-        println!("{:?}", x.into_iter().collect::<Result<Vec<_>, _>>());
+        println!("{:?}", x.into_iter().collect::<Vec<_>>());
 
-        stream_events::<JsxHandler, Vec<&'_ str>>(xemel, &mut JsxVisitor::new()).unwrap();
+        stream_events::<Vec<&'_ str>, JsxParser, _>(xemel, &mut JsxVisitor::new()).unwrap();
         println!();
-        stream_events::<JsxHandler, Vec<&'_ str>>("&#00a0;", &mut JsxVisitor::new()).unwrap();
+        stream_events::<Vec<&'_ str>, JsxParser, _>("&#00a0;", &mut JsxVisitor::new()).unwrap();
     }
 }
