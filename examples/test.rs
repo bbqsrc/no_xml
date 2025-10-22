@@ -1,3 +1,5 @@
+#![feature(str_from_utf16_endian)]
+
 use no_xml::{Error, Visitor, stream_xml_events};
 use std::collections::HashMap;
 
@@ -449,13 +451,30 @@ fn run_test(test: &Test, base_path: &str) -> TestResult {
     let test_file_path = format!("{}{}", base_path, test.uri);
 
     // Try to parse the test file
-    let parse_result = std::fs::read_to_string(&test_file_path).and_then(|content| {
-        struct DummyVisitor;
-        impl Visitor for DummyVisitor {}
+    let buf = std::fs::read(&test_file_path).expect("Failed to read test file");
 
-        stream_xml_events::<Vec<&'_ str>>(&content, &mut DummyVisitor)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
+    // Check for LE and BE UTF-16 BOMs and convert to UTF-8
+    let content = match if buf.starts_with(&[0xFE, 0xFF]) {
+        String::from_utf16be(&buf).map_err(|e| e.to_string())
+    } else if buf.starts_with(&[0xFF, 0xFE]) {
+        String::from_utf16le(&buf).map_err(|e| e.to_string())
+    } else {
+        String::from_utf8(buf).map_err(|e| e.to_string())
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            return TestResult::Fail {
+                error_msg: Some(format!("Failed to decode test file: {}", e)),
+                expected: "successful parse".to_string(),
+                actual: "failed to decode test file".to_string(),
+            };
+        }
+    };
+
+    struct DummyVisitor;
+    impl Visitor for DummyVisitor {}
+
+    let parse_result = stream_xml_events::<Vec<&'_ str>>(&content, &mut DummyVisitor);
 
     let parse_succeeded = parse_result.is_ok();
     let should_succeed = test.test_type == "valid";
@@ -477,7 +496,8 @@ fn run_test(test: &Test, base_path: &str) -> TestResult {
             actual: if parse_succeeded {
                 "successful parse".to_string()
             } else {
-                format!("parse failure: {}", parse_result.unwrap_err())
+                let err = parse_result.unwrap_err();
+                format!("{}:{} {}", test_file_path, err.span, err.kind)
             },
         }
     }

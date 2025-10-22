@@ -84,6 +84,7 @@ pub enum Punc {
     Ampersand,
     Percent,
     QuoteMark,
+    SingleQuote,
     Equals,
     QuestionMark,
     ExclamationMark,
@@ -134,6 +135,7 @@ impl Punc {
             Self::Slash => "/",
             Self::Ampersand => "&",
             Self::QuoteMark => "\"",
+            Self::SingleQuote => "'",
             Self::Equals => "=",
             Self::NumberSign => "#",
             Self::Percent => "%",
@@ -160,6 +162,7 @@ impl TryFrom<&str> for Punc {
             "/" => Self::Slash,
             "&" => Self::Ampersand,
             "\"" => Self::QuoteMark,
+            "'" => Self::SingleQuote,
             "=" => Self::Equals,
             "#" => Self::NumberSign,
             "%" => Self::Percent,
@@ -270,8 +273,8 @@ pub type Spanned<T> = (Span, T);
 
 #[derive(Debug, Clone)]
 pub struct Error {
-    span: Span,
-    kind: ErrorKind,
+    pub span: Span,
+    pub kind: ErrorKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,22 +291,27 @@ pub enum ErrorKind {
     DoctypeNestingTooDeep,
 }
 
+impl core::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ErrorKind::UnexpectedEof => write!(f, "Unexpected end of file"),
+            ErrorKind::MismatchedTag => write!(f, "Mismatched tag"),
+            ErrorKind::InvalidClosingTag => write!(f, "Invalid closing tag"),
+            ErrorKind::InvalidAttributeSyntax => write!(f, "Invalid attribute syntax"),
+            ErrorKind::InvalidEntity => write!(f, "Invalid entity"),
+            ErrorKind::SelfClosingTagNotClosed => write!(f, "Self-closing tag not closed"),
+            ErrorKind::UnexpectedToken => write!(f, "Unexpected token"),
+            ErrorKind::TagNameExpected => write!(f, "Tag name expected"),
+            ErrorKind::UnimplementedFeature => write!(f, "Unimplemented feature"),
+            ErrorKind::DoctypeNestingTooDeep => write!(f, "DOCTYPE nesting too deep"),
+        }
+    }
+}
+
 impl core::error::Error for Error {}
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.kind {
-            ErrorKind::UnexpectedEof => write!(f, "Unexpected end of file")?,
-            ErrorKind::MismatchedTag => write!(f, "Mismatched tag")?,
-            ErrorKind::InvalidClosingTag => write!(f, "Invalid closing tag")?,
-            ErrorKind::InvalidAttributeSyntax => write!(f, "Invalid attribute syntax")?,
-            ErrorKind::InvalidEntity => write!(f, "Invalid entity")?,
-            ErrorKind::SelfClosingTagNotClosed => write!(f, "Self-closing tag not closed")?,
-            ErrorKind::UnexpectedToken => write!(f, "Unexpected token")?,
-            ErrorKind::TagNameExpected => write!(f, "Tag name expected")?,
-            ErrorKind::UnimplementedFeature => write!(f, "Unimplemented feature")?,
-            ErrorKind::DoctypeNestingTooDeep => write!(f, "DOCTYPE nesting too deep")?,
-        }
-        write!(f, " ({})", self.span)
+        write!(f, "{} ({})", self.kind, self.span)
     }
 }
 
@@ -786,8 +794,8 @@ where
     AttrExpectingEqOrNamespace(&'s str, Position),
     AttrExpectingNamespaceLocalName(&'s str, Position),
     AttrExpectingOpeningQuote(&'s str),
-    AttrExpectingValue(&'s str, Position),
-    AttrExpectingClosingQuote(&'s str, Position),
+    AttrExpectingValue(&'s str, Position, Punc),
+    AttrExpectingClosingQuote(&'s str, Position, Punc),
     EntityRefExpectingValue(Position),
     EntityRefExpectingNumerals(Position),
     EntityRefExpectingSemicolon(Position),
@@ -1252,7 +1260,10 @@ where
                 }
             }
             State::AttrExpectingEqOrNamespace(key, key_start) => {
-                if matches!(token, Token::Punc(Punc::Equals)) {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    // Skip whitespace before equals sign
+                    continue;
+                } else if matches!(token, Token::Punc(Punc::Equals)) {
                     state = State::AttrExpectingOpeningQuote(key);
                 } else if matches!(token, Token::Punc(Punc::Colon)) {
                     state = State::AttrExpectingNamespaceLocalName(key, key_start);
@@ -1274,18 +1285,28 @@ where
                     });
                 }
             }
-            State::AttrExpectingValue(key, start_pos) => {
-                if matches!(token, Token::Punc(Punc::QuoteMark)) {
+            State::AttrExpectingValue(key, start_pos, quote_type) => {
+                if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
                     visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
                 } else {
-                    state = State::AttrExpectingClosingQuote(key, start_pos);
+                    state = State::AttrExpectingClosingQuote(key, start_pos, quote_type);
                 }
             }
             State::AttrExpectingOpeningQuote(key) => {
-                if matches!(token, Token::Punc(Punc::QuoteMark)) {
-                    state = State::AttrExpectingValue(key, span.end);
+                if matches!(token, Token::WhiteSpace(_)) {
+                    // Skip whitespace after equals sign
+                    continue;
+                } else if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        state = State::AttrExpectingValue(key, span.end, quote);
+                    } else {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidAttributeSyntax,
+                        });
+                    }
                 } else {
                     return Err(Error {
                         span,
@@ -1293,8 +1314,8 @@ where
                     });
                 }
             }
-            State::AttrExpectingClosingQuote(key, start_pos) => {
-                if matches!(token, Token::Punc(Punc::QuoteMark)) {
+            State::AttrExpectingClosingQuote(key, start_pos, quote_type) => {
+                if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
                     visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
