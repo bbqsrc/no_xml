@@ -26,8 +26,8 @@ macro_rules! debug {
 #[cfg(feature = "std")]
 macro_rules! debug {
     ($($arg:tt)*) => {
-        // println!($($arg)*)
-        ()
+        println!($($arg)*)
+        // ()
     };
 }
 
@@ -65,17 +65,6 @@ impl TryFrom<char> for WhiteSpace {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Literal<'t> {
-    EntityValue(&'t ()),
-    AttValue,
-    SystemLiteral,
-    PubidLiteral,
-    PubidChar,
-    CharData,
-    Comment,
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Punc {
     TagStart,
@@ -92,7 +81,7 @@ pub enum Punc {
     Colon,
     Semicolon,
     Dot,
-    // Dash,
+    Dash,
     Underscore,
     LeftSquareBracket,
     RightSquareBracket,
@@ -109,6 +98,8 @@ pub enum Delim {
     Doctype,
     Entity,
     Element,
+    Notation,
+    Attlist,
 }
 
 impl Delim {
@@ -123,6 +114,8 @@ impl Delim {
             Delim::Doctype => "<!DOCTYPE",
             Delim::Entity => "<!ENTITY",
             Delim::Element => "<!ELEMENT",
+            Delim::Notation => "<!NOTATION",
+            Delim::Attlist => "<!ATTLIST",
         }
     }
 }
@@ -142,7 +135,7 @@ impl Punc {
             Self::QuestionMark => "?",
             Self::ExclamationMark => "!",
             Self::Dot => ".",
-            // Self::Dash => "-",
+            Self::Dash => "-",
             Self::Underscore => "_",
             Self::Colon => ":",
             Self::Semicolon => ";",
@@ -169,7 +162,7 @@ impl TryFrom<&str> for Punc {
             "?" => Self::QuestionMark,
             "!" => Self::ExclamationMark,
             "." => Self::Dot,
-            // "-" => Self::Dash,
+            "-" => Self::Dash,
             "_" => Self::Underscore,
             ":" => Self::Colon,
             ";" => Self::Semicolon,
@@ -284,7 +277,6 @@ pub enum ErrorKind {
     InvalidClosingTag,
     InvalidAttributeSyntax,
     InvalidEntity,
-    SelfClosingTagNotClosed,
     UnexpectedToken,
     TagNameExpected,
     UnimplementedFeature,
@@ -299,7 +291,6 @@ impl core::fmt::Display for ErrorKind {
             ErrorKind::InvalidClosingTag => write!(f, "Invalid closing tag"),
             ErrorKind::InvalidAttributeSyntax => write!(f, "Invalid attribute syntax"),
             ErrorKind::InvalidEntity => write!(f, "Invalid entity"),
-            ErrorKind::SelfClosingTagNotClosed => write!(f, "Self-closing tag not closed"),
             ErrorKind::UnexpectedToken => write!(f, "Unexpected token"),
             ErrorKind::TagNameExpected => write!(f, "Tag name expected"),
             ErrorKind::UnimplementedFeature => write!(f, "Unimplemented feature"),
@@ -669,6 +660,17 @@ fn delim_directive<'t, T: NonStandardToken>(
         return (Some(buf.consume_with_span(Delim::Element)), buf);
     }
 
+    if cur == "<!ATTLIST" {
+        return (Some(buf.consume_with_span(Delim::Attlist)), buf);
+    }
+
+    buf.buffer_chars_up_to(10);
+    let cur = buf.peek_substr(10);
+
+    if cur == "<!NOTATION" {
+        return (Some(buf.consume_with_span(Delim::Notation)), buf);
+    }
+
     return (None, base_buf);
 }
 
@@ -787,10 +789,13 @@ where
 
     None,
     StartTagExpectingName,
+    StartTagNameContent(Position),
     StartTagExpectingAttrs,
     StartTagExpectingGt,
     EndTagExpectingName,
+    EndTagNameContent(Position),
     EndTagExpectingGt(&'s str),
+    AttrNameContent(Position),
     AttrExpectingEqOrNamespace(&'s str, Position),
     AttrExpectingNamespaceLocalName(&'s str, Position),
     AttrExpectingOpeningQuote(&'s str),
@@ -799,8 +804,22 @@ where
     EntityRefExpectingValue(Position),
     EntityRefExpectingNumerals(Position),
     EntityRefExpectingSemicolon(Position),
-    EntityDeclExpectingContent,
+    EntityDeclExpectingOptionalPercent,
+    PEDeclExpectingContent,
+    EntityDeclNameContent(Position),
+    EntityDeclExpectingValue,
+    EntityValueContent(Position, Punc),
+    EntityDeclSystemExpectingLiteral,
+    EntitySystemLiteralContent(Position, Punc),
+    EntityDeclPublicExpectingPubid,
+    EntityPubidLiteralContent(Position, Punc),
+    EntityDeclPublicExpectingSystem,
+    EntityDeclExpectingOptionalNData,
+    EntityDeclNDataExpectingName,
+    EntityDeclExpectingGt,
     ElementDeclExpectingContent,
+    NotationDeclExpectingContent,
+    AttlistDeclExpectingContent,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -812,40 +831,6 @@ pub enum StateMode {
     Doctype,
     DoctypeInner(u8),
 }
-
-// pub trait NonStandardEventHandler<'s>: Default + Copy {
-//     type Token: NonStandardToken;
-//     type State: Debug + Copy;
-//     type Visitor: Visitor;
-
-//     fn process_state(
-//         &mut self,
-//         span: Span,
-//         token: Token<'s, Self::Token>,
-//         state: State<'s, Self::State>,
-//         path: &mut impl ListMut<&'s str>,
-//         visitor: &mut Self::Visitor,
-//         raw_input: &'s str,
-//     ) -> Result<State<'s, Self::State>, Error>;
-// }
-
-// impl<'s> NonStandardEventHandler<'s> for () {
-//     type Token = ();
-//     type State = ();
-//     type Visitor = XmlVisitor;
-
-//     fn process_state(
-//         &mut self,
-//         _span: Span,
-//         _token: Token<'s, Self::Token>,
-//         state: State<'s, Self::State>,
-//         _path: &mut impl ListMut<&'s str>,
-//         _visitor: &mut Self::Visitor,
-//         _raw_input: &'s str,
-//     ) -> Result<State<'s, Self::State>, Error> {
-//         Ok(state)
-//     }
-// }
 
 pub trait Parser<V: Visitor>: Default {
     type Token: NonStandardToken;
@@ -935,37 +920,6 @@ pub trait Visitor {
     }
 }
 
-fn parse_doctype_header(content: &str) -> (Option<&str>, Option<&str>) {
-    let content = content.trim();
-    if content.is_empty() {
-        return (None, None);
-    }
-
-    let mut parts = content.splitn(2, |c: char| c.is_whitespace());
-    let name = parts.next().filter(|s| !s.is_empty());
-    let external_id = parts
-        .next()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim());
-
-    (name, external_id)
-}
-
-fn split_doctype_content(full_content: &str, subset_offset: usize) -> (&str, &str) {
-    let header_end = subset_offset.saturating_sub(1);
-    let header = full_content[..header_end].trim();
-
-    let subset_start = subset_offset;
-    let subset_content = &full_content[subset_start..];
-
-    if let Some(end_bracket) = subset_content.rfind(']') {
-        let internal_subset = subset_content[..end_bracket].trim();
-        (header, internal_subset)
-    } else {
-        (header, subset_content.trim())
-    }
-}
-
 pub fn stream_xml_events<'s, L>(input: &'s str, visitor: &mut impl Visitor) -> Result<(), Error>
 where
     L: ListMut<&'s str> + Default + Debug,
@@ -987,7 +941,6 @@ where
 
     loop {
         let (span, token, b) = tokenize(buf, state_mode)?;
-        // println!("Token: {:?} at {span}", token);
         buf = b;
 
         if matches!(token, Token::Eof) {
@@ -995,10 +948,12 @@ where
             break;
         }
 
+        // println!("Token: {:?} at {span}", token);
+
         // debug!("[state:1] {state:?} {path:?}");
         state = parser.process_state(span, token.clone(), state, &mut path, visitor, input)?;
 
-        // debug!("[state:2] {state:?}");
+        // debug!("[state] {token:?} {state:?} {state_mode:?} {path:?}");
 
         if matches!(state_mode, StateMode::Doctype) {
             if matches!(token, Token::Punc(Punc::TagEnd)) {
@@ -1039,7 +994,7 @@ where
                 continue;
             }
 
-            if matches!(token, Token::WhiteSpace(_)) {
+            if matches!(state, State::None) && matches!(token, Token::WhiteSpace(_)) {
                 continue;
             }
 
@@ -1068,6 +1023,7 @@ where
             if let Token::Delim(Delim::CommentEnd) = token {
                 visitor.end_comment()?;
                 state_mode = StateMode::None;
+                continue;
             }
 
             if let Some(text) = token.to_text() {
@@ -1156,13 +1112,20 @@ where
                             continue;
                         }
                         Delim::Entity => {
-                            state = State::EntityDeclExpectingContent;
-                            visitor.start_entity_declaration()?;
+                            state = State::EntityDeclExpectingOptionalPercent;
                             continue;
                         }
                         Delim::Element => {
                             state = State::ElementDeclExpectingContent;
                             visitor.start_element_declaration()?;
+                            continue;
+                        }
+                        Delim::Notation => {
+                            state = State::NotationDeclExpectingContent;
+                            continue;
+                        }
+                        Delim::Attlist => {
+                            state = State::AttlistDeclExpectingContent;
                             continue;
                         }
                         _ => {}
@@ -1179,21 +1142,41 @@ where
                     continue;
                 }
 
-                if let Some(name) = token.to_text() {
+                state = State::StartTagNameContent(span.start);
+            }
+            State::StartTagNameContent(start_pos) => {
+                // Stop on whitespace, /, >, or text (which would be an attribute name)
+                if matches!(token, Token::WhiteSpace(_)) {
+                    let name = &input[start_pos.index..span.start.index];
                     path.push(name);
-
                     visitor.start_tag(name)?;
-
                     state = State::StartTagExpectingAttrs;
                     continue;
                 }
 
-                return Err(Error {
-                    span,
-                    kind: ErrorKind::TagNameExpected,
-                });
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    let name = &input[start_pos.index..span.start.index];
+                    path.push(name);
+                    visitor.start_tag(name)?;
+                    state = State::None;
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::Slash)) {
+                    let name = &input[start_pos.index..span.start.index];
+                    path.push(name);
+                    visitor.start_tag(name)?;
+                    state = State::StartTagExpectingGt;
+                    continue;
+                }
+
+                // Continue consuming name (text, punctuation like -, _, ., etc.)
             }
             State::StartTagExpectingAttrs => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
                 if matches!(token, Token::Punc(Punc::Slash)) {
                     state = State::StartTagExpectingGt;
                     continue;
@@ -1201,14 +1184,17 @@ where
 
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     state = State::None;
+                    continue;
                 }
 
-                if let Token::Text(text) = token {
-                    state = State::AttrExpectingEqOrNamespace(text, span.start);
-                }
+                // Start of attribute name (could be text or punctuation like :)
+                state = State::AttrNameContent(span.start);
             }
             State::StartTagExpectingGt => {
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    // if !path.contains(&"TESTCASES") {
+                    //     println!("POP GT {:?}", path);
+                    // }
                     let name = path.pop().unwrap();
 
                     visitor.end_tag(name)?;
@@ -1218,11 +1204,15 @@ where
                 } else {
                     return Err(Error {
                         span,
-                        kind: ErrorKind::SelfClosingTagNotClosed,
+                        kind: ErrorKind::InvalidClosingTag,
                     });
                 }
             }
             State::EndTagExpectingGt(name) => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     visitor.end_tag(name)?;
 
@@ -1240,24 +1230,83 @@ where
                     continue;
                 }
 
-                if let Token::Text(name) = token {
+                state = State::EndTagNameContent(span.start);
+            }
+            State::EndTagNameContent(start_pos) => {
+                // Stop on whitespace or >
+                if matches!(token, Token::WhiteSpace(_)) {
+                    let name = &input[start_pos.index..span.start.index];
+
                     if let Some(tag) = path.pop() {
-                        if tag != name {
+                        if tag != name[1..].trim() {
                             return Err(Error {
                                 span,
                                 kind: ErrorKind::MismatchedTag,
                             });
                         }
 
-                        // debug!("End tag: {}", name);
-                        state = State::EndTagExpectingGt(name);
+                        state = State::EndTagExpectingGt(tag);
                     } else {
                         return Err(Error {
                             span,
                             kind: ErrorKind::InvalidClosingTag,
                         });
                     }
+                    continue;
                 }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    let name = &input[start_pos.index..span.start.index];
+
+                    if let Some(tag) = path.pop() {
+                        if tag != name[1..].trim() {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::MismatchedTag,
+                            });
+                        }
+
+                        visitor.end_tag(tag)?;
+                        state = State::None;
+                    } else {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidClosingTag,
+                        });
+                    }
+                    continue;
+                }
+
+                // Continue consuming name (text, punctuation like -, _, ., etc.)
+            }
+            State::AttrNameContent(start_pos) => {
+                // Stop on whitespace, =, :, /, or >
+                if matches!(token, Token::WhiteSpace(_)) {
+                    let name = &input[start_pos.index..span.start.index];
+                    state = State::AttrExpectingEqOrNamespace(name, start_pos);
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::Equals)) {
+                    let name = &input[start_pos.index..span.start.index];
+                    state = State::AttrExpectingOpeningQuote(name);
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::Colon)) {
+                    let prefix = &input[start_pos.index..span.start.index];
+                    state = State::AttrExpectingNamespaceLocalName(prefix, start_pos);
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd | Punc::Slash)) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidAttributeSyntax,
+                    });
+                }
+
+                // Continue consuming name (text, punctuation like -, _, ., etc.)
             }
             State::AttrExpectingEqOrNamespace(key, key_start) => {
                 if matches!(token, Token::WhiteSpace(_)) {
@@ -1275,15 +1324,27 @@ where
                 }
             }
             State::AttrExpectingNamespaceLocalName(_prefix, prefix_start) => {
-                if let Token::Text(_local_name) = token {
-                    let full_name = &input[prefix_start.index..span.end.index];
+                // Stop on whitespace, =, /, or >
+                if matches!(token, Token::WhiteSpace(_)) {
+                    let full_name = &input[prefix_start.index..span.start.index];
                     state = State::AttrExpectingEqOrNamespace(full_name, prefix_start);
-                } else {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::Equals)) {
+                    let full_name = &input[prefix_start.index..span.start.index];
+                    state = State::AttrExpectingOpeningQuote(full_name);
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd | Punc::Slash)) {
                     return Err(Error {
                         span,
                         kind: ErrorKind::InvalidAttributeSyntax,
                     });
                 }
+
+                // Continue consuming name (text, punctuation like -, _, ., etc.)
             }
             State::AttrExpectingValue(key, start_pos, quote_type) => {
                 if matches!(token, Token::Punc(q) if q == quote_type) {
@@ -1358,17 +1419,208 @@ where
                     state = State::None;
                 }
             }
-            State::EntityDeclExpectingContent => {
+            State::EntityDeclExpectingOptionalPercent => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::Percent)) {
+                    state = State::PEDeclExpectingContent;
+                    continue;
+                }
+
+                visitor.start_entity_declaration()?;
+                state = State::EntityDeclNameContent(span.start);
+            }
+            State::PEDeclExpectingContent => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    continue;
+                }
+            }
+            State::EntityDeclNameContent(start_pos) => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    let name = &input[start_pos.index..span.start.index];
+                    visitor.entity_declaration(name)?;
+                    state = State::EntityDeclExpectingValue;
+                    continue;
+                }
+
+                if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        // Name ended, quote starts EntityValue directly
+                        let name = &input[start_pos.index..span.start.index];
+                        visitor.entity_declaration(name)?;
+                        state = State::EntityValueContent(span.end, quote);
+                        continue;
+                    }
+                }
+            }
+            State::EntityDeclExpectingValue => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                // Check for EntityValue (quoted string)
+                if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        state = State::EntityValueContent(span.end, quote);
+                        continue;
+                    }
+                }
+
+                // Check for ExternalID (SYSTEM or PUBLIC)
+                if let Token::Text(text) = token {
+                    if text == "SYSTEM" {
+                        visitor.entity_declaration(text)?;
+                        state = State::EntityDeclSystemExpectingLiteral;
+                        continue;
+                    } else if text == "PUBLIC" {
+                        visitor.entity_declaration(text)?;
+                        state = State::EntityDeclPublicExpectingPubid;
+                        continue;
+                    }
+                }
+
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+            State::EntityValueContent(start_pos, quote_type) => {
+                if matches!(token, Token::Punc(q) if q == quote_type) {
+                    let value = &input[start_pos.index..span.start.index];
+                    visitor.entity_declaration(value)?;
+                    state = State::EntityDeclExpectingGt;
+                    continue;
+                }
+            }
+            State::EntityDeclSystemExpectingLiteral => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        state = State::EntitySystemLiteralContent(span.end, quote);
+                        continue;
+                    }
+                }
+
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+            State::EntitySystemLiteralContent(start_pos, quote_type) => {
+                // println!("SYSTEM LITERAL CONTENT {:?}", quote_type);
+                if matches!(token, Token::Punc(q) if q == quote_type) {
+                    let value = &input[start_pos.index..span.start.index];
+                    visitor.entity_declaration(value)?;
+                    state = State::EntityDeclExpectingOptionalNData;
+                    continue;
+                }
+                // Everything else is literal content
+            }
+            State::EntityDeclPublicExpectingPubid => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        state = State::EntityPubidLiteralContent(span.end, quote);
+                        continue;
+                    }
+                }
+
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+            State::EntityPubidLiteralContent(start_pos, quote_type) => {
+                // println!("wat");
+                if matches!(token, Token::Punc(q) if q == quote_type) {
+                    let value = &input[start_pos.index..span.start.index];
+                    visitor.entity_declaration(value)?;
+                    state = State::EntityDeclPublicExpectingSystem;
+                    continue;
+                }
+                // Everything else is literal content
+            }
+            State::EntityDeclPublicExpectingSystem => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if let Token::Punc(quote) = token {
+                    if matches!(quote, Punc::QuoteMark | Punc::SingleQuote) {
+                        state = State::EntitySystemLiteralContent(span.end, quote);
+                        continue;
+                    }
+                }
+
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+            State::EntityDeclExpectingOptionalNData => {
+                // println!("NDATA CHECK");
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if let Token::Text(text) = token {
+                    // println!("TEXT NDATA: {}", text);
+                    if text == "NDATA" {
+                        state = State::EntityDeclNDataExpectingName;
+                        continue;
+                    }
+                }
+
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     state = State::None;
                     visitor.end_entity_declaration()?;
                     continue;
                 }
 
-                if let Some(value) = token.to_text() {
-                    visitor.entity_declaration(value)?;
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+            State::EntityDeclNDataExpectingName => {
+                if matches!(token, Token::WhiteSpace(_)) {
                     continue;
                 }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    visitor.end_entity_declaration()?;
+                    continue;
+                }
+            }
+            State::EntityDeclExpectingGt => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    visitor.end_entity_declaration()?;
+                    continue;
+                }
+
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
             }
             State::ElementDeclExpectingContent => {
                 if matches!(token, Token::WhiteSpace(_)) {
@@ -1383,6 +1635,26 @@ where
 
                 if let Some(value) = token.to_text() {
                     visitor.element_declaration(value)?;
+                    continue;
+                }
+            }
+            State::NotationDeclExpectingContent => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    continue;
+                }
+            }
+            State::AttlistDeclExpectingContent => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
                     continue;
                 }
             }

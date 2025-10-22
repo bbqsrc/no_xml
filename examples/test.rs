@@ -202,6 +202,7 @@ impl Visitor for TestSuiteVisitor {
     fn entity_declaration(&mut self, content: &str) -> Result<(), Error> {
         if let Some(ref mut entity_content) = self.current_entity_content {
             entity_content.push_str(content);
+            entity_content.push(' ');
         }
         Ok(())
     }
@@ -245,14 +246,62 @@ impl Visitor for TestSuiteVisitor {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let filter_type = if args.len() > 1 {
-        Some(args[1].as_str())
-    } else {
-        None
-    };
+
+    // Check for -p flag to test a single file
+    let mut path_to_test = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-p" && i + 1 < args.len() {
+            path_to_test = Some(args[i + 1].as_str());
+            break;
+        }
+        i += 1;
+    }
+
+    if let Some(path) = path_to_test {
+        println!("Testing file: {}\n", path);
+
+        let buf = std::fs::read(path)?;
+        let content = match if buf.starts_with(&[0xFE, 0xFF]) {
+            String::from_utf16be(&buf).map_err(|e| e.to_string())
+        } else if buf.starts_with(&[0xFF, 0xFE]) {
+            String::from_utf16le(&buf).map_err(|e| e.to_string())
+        } else {
+            String::from_utf8(buf).map_err(|e| e.to_string())
+        } {
+            Ok(s) => s,
+            Err(e) => {
+                println!("FAIL: Failed to decode file: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        struct DummyVisitor;
+        impl Visitor for DummyVisitor {}
+
+        match stream_xml_events::<Vec<&'_ str>>(&content, &mut DummyVisitor) {
+            Ok(_) => {
+                println!("PASS: File parsed successfully");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("FAIL: {}:{} {}", path, e.span, e.kind);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let filter_type = args.get(1).map(|s| s.as_str());
+    let filter_id = args.get(2).map(|s| s.as_str());
 
     if let Some(filter) = filter_type {
-        println!("Filtering tests by TYPE={:?}\n", filter);
+        println!("Filtering tests by TYPE={:?}", filter);
+    }
+    if let Some(filter) = filter_id {
+        println!("Filtering tests by ID={:?}", filter);
+    }
+    if filter_type.is_some() || filter_id.is_some() {
+        println!();
     }
 
     let xml_content = std::fs::read_to_string("xmlconf/xmlconf.xml")?;
@@ -298,19 +347,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
 
                             for test in &tests {
-                                // Skip tests that don't match the filter
+                                // Skip tests that don't match the type filter
                                 if let Some(filter) = filter_type {
                                     if test.test_type != filter {
                                         continue;
                                     }
                                 }
 
-                                // Skip non-1.0 XML tests
-                                if let Some(ref version) = test.version {
-                                    if version != "1.0" {
+                                // Skip tests that don't match the ID filter
+                                if let Some(filter) = filter_id {
+                                    if test.id != filter {
                                         continue;
                                     }
                                 }
+
+                                // // Skip non-1.0 XML tests
+                                // if let Some(ref version) = test.version {
+                                //     if version != "1.0" {
+                                //         continue;
+                                //     }
+                                // }
 
                                 let result = run_test(test, &base_dir);
                                 match result {
@@ -451,7 +507,16 @@ fn run_test(test: &Test, base_path: &str) -> TestResult {
     let test_file_path = format!("{}{}", base_path, test.uri);
 
     // Try to parse the test file
-    let buf = std::fs::read(&test_file_path).expect("Failed to read test file");
+    let buf = match std::fs::read(&test_file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return TestResult::Fail {
+                error_msg: Some(format!("Failed to read test file: {}", e)),
+                expected: "successful parse".to_string(),
+                actual: "failed to read test file".to_string(),
+            };
+        }
+    };
 
     // Check for LE and BE UTF-16 BOMs and convert to UTF-8
     let content = match if buf.starts_with(&[0xFE, 0xFF]) {
@@ -459,14 +524,14 @@ fn run_test(test: &Test, base_path: &str) -> TestResult {
     } else if buf.starts_with(&[0xFF, 0xFE]) {
         String::from_utf16le(&buf).map_err(|e| e.to_string())
     } else {
-        String::from_utf8(buf).map_err(|e| e.to_string())
+        Ok(String::from_utf8_lossy(&buf).to_string())
     } {
         Ok(s) => s,
         Err(e) => {
             return TestResult::Fail {
                 error_msg: Some(format!("Failed to decode test file: {}", e)),
                 expected: "successful parse".to_string(),
-                actual: "failed to decode test file".to_string(),
+                actual: format!("failed to decode test file: {test_file_path}"),
             };
         }
     };
