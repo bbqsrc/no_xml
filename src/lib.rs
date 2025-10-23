@@ -355,7 +355,7 @@ where
 {
     #[inline]
     pub fn new(buf: &'a str) -> Self {
-        Self {
+        let mut cursor = Self {
             start_pos: 0,
             start_line: 1,
             start_col: 1,
@@ -366,7 +366,9 @@ where
             data: buf,
             chars: buf.char_indices().peekable(),
             _ty: PhantomData,
-        }
+        };
+        cursor.skip_bom();
+        cursor
     }
 
     #[inline]
@@ -520,6 +522,14 @@ where
     #[inline]
     fn is_empty(&self) -> bool {
         self.peek_str().is_empty()
+    }
+
+    #[inline]
+    fn skip_bom(&mut self) {
+        if self.peek_next_char() == Some('\u{FEFF}') {
+            self.buffer_char();
+            self.consume();
+        }
     }
 }
 
@@ -748,6 +758,10 @@ where
     if !buf.is_empty() {
         if let Some(chs) = buf.peek_next_char_str() {
             let ch = chs.chars().next().unwrap();
+            if ch == '\u{FEFF}' {
+                panic!("BOM");
+            }
+
             if WhiteSpace::try_from(ch).is_ok()
                 || Punc::try_from(chs).is_ok()
                 || T::handle_char(ch).is_some()
@@ -775,6 +789,7 @@ where
     }
 
     let ch = buf.peek_str().chars().next().unwrap();
+
     if let Ok(ws) = WhiteSpace::try_from(ch) {
         let span = buf.consume();
         return Ok((span, Token::WhiteSpace(ws), buf));
@@ -858,8 +873,14 @@ pub enum StateMode {
     CData,
     Comment,
     ProcessingInstruction,
-    Doctype,
-    DoctypeInner(u8),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum DocumentState {
+    BeforeRoot,
+    InDoctype(u8),
+    InRoot,
+    AfterRoot,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1036,10 +1057,24 @@ pub fn stream_xml_events<'s, L>(input: &'s str, visitor: &mut impl Visitor) -> R
 where
     L: ListMut<&'s str> + Default + Debug,
 {
-    stream_events::<L, XmlParser, _>(input, visitor)
+    stream_events::<L, XmlParser, _>(input, visitor, false)
 }
 
-pub fn stream_events<'s, L, P, V>(input: &'s str, visitor: &mut V) -> Result<(), Error>
+pub fn stream_xml_events_fragment<'s, L>(
+    input: &'s str,
+    visitor: &mut impl Visitor,
+) -> Result<(), Error>
+where
+    L: ListMut<&'s str> + Default + Debug,
+{
+    stream_events::<L, XmlParser, _>(input, visitor, true)
+}
+
+pub fn stream_events<'s, L, P, V>(
+    input: &'s str,
+    visitor: &mut V,
+    fragment: bool,
+) -> Result<(), Error>
 where
     V: Visitor,
     P: Parser<V> + Default,
@@ -1050,13 +1085,25 @@ where
     let mut state: State<P::State<'s>> = State::None;
     let mut state_mode = StateMode::None;
     let mut parser = P::default();
+    let mut current_tag_attrs = L::default();
+    let mut doc_state = if fragment {
+        DocumentState::InRoot
+    } else {
+        DocumentState::BeforeRoot
+    };
 
     loop {
         let (span, token, b) = tokenize(buf)?;
         buf = b;
 
         if matches!(token, Token::Eof) {
-            // debug!("EOF reached");
+            if !fragment && !matches!(doc_state, DocumentState::AfterRoot) {
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedEof,
+                });
+            }
+
             break;
         }
 
@@ -1067,16 +1114,16 @@ where
 
         // debug!("[state] {token:?} {state:?} {state_mode:?} {path:?}");
 
-        if matches!(state_mode, StateMode::Doctype) {
+        if doc_state == DocumentState::InDoctype(0) {
             if matches!(token, Token::Punc(Punc::TagEnd)) {
                 visitor.end_doctype()?;
-                state_mode = StateMode::None;
+                doc_state = DocumentState::BeforeRoot;
                 continue;
             }
 
             if matches!(token, Token::Punc(Punc::LeftSquareBracket)) {
                 visitor.doctype("[")?;
-                state_mode = StateMode::DoctypeInner(0);
+                doc_state = DocumentState::InDoctype(1);
                 continue;
             }
 
@@ -1092,19 +1139,31 @@ where
             continue;
         }
 
-        if let StateMode::DoctypeInner(depth) = state_mode {
-            if matches!(token, Token::Punc(Punc::RightSquareBracket)) {
-                if depth == 0 {
+        if let DocumentState::InDoctype(depth) = doc_state {
+            let in_quoted_content = matches!(
+                state,
+                State::EntityValueContent(_, _)
+                    | State::EntitySystemLiteralContent(_, _)
+                    | State::EntityPubidLiteralContent(_, _)
+                    | State::AttrExpectingValue(_, _, _)
+                    | State::AttrExpectingClosingQuote(_, _, _)
+            );
+
+            if depth > 0
+                && !in_quoted_content
+                && matches!(token, Token::Punc(Punc::RightSquareBracket))
+            {
+                if depth == 1 {
                     visitor.doctype("]")?;
-                    state_mode = StateMode::Doctype;
+                    doc_state = DocumentState::InDoctype(0);
                 } else {
-                    state_mode = StateMode::DoctypeInner(depth - 1);
+                    doc_state = DocumentState::InDoctype(depth - 1);
                 }
 
                 continue;
             }
 
-            if matches!(state, State::None) && matches!(token, Token::WhiteSpace(_)) {
+            if depth > 0 && matches!(state, State::None) && matches!(token, Token::WhiteSpace(_)) {
                 continue;
             }
 
@@ -1205,6 +1264,7 @@ where
                         continue;
                     }
 
+                    current_tag_attrs.clear();
                     state = State::StartTagExpectingName;
                     continue;
                 }
@@ -1217,6 +1277,7 @@ where
                         });
                     }
                     Token::Eof => {
+                        panic!("HI");
                         return Err(Error {
                             span,
                             kind: ErrorKind::UnexpectedEof,
@@ -1225,6 +1286,12 @@ where
                     Token::Punc(punc) => visitor.text(punc.as_str())?,
                     Token::Delim(val) => match val {
                         Delim::CDataStart => {
+                            if doc_state != DocumentState::InRoot {
+                                return Err(Error {
+                                    span,
+                                    kind: ErrorKind::UnexpectedToken,
+                                });
+                            }
                             state_mode = StateMode::CData;
                             continue;
                         }
@@ -1240,7 +1307,7 @@ where
                             continue;
                         }
                         Delim::Doctype => {
-                            state_mode = StateMode::Doctype;
+                            doc_state = DocumentState::InDoctype(0);
                             visitor.start_doctype()?;
                             continue;
                         }
@@ -1269,9 +1336,35 @@ where
                         }
                         _ => {}
                     },
-                    Token::Text(text) => visitor.text(text)?,
+                    Token::Text(text) => {
+                        if !fragment && doc_state == DocumentState::AfterRoot {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        if !fragment
+                            && doc_state == DocumentState::BeforeRoot
+                            && matches!(state_mode, StateMode::None)
+                            && !text.trim().is_empty()
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        visitor.text(text)?
+                    }
                     Token::WhiteSpace(ws) => visitor.text(ws.as_str())?,
-                    Token::EntityRef(entity) => visitor.entity_ref(entity)?,
+                    Token::EntityRef(entity) => {
+                        if !fragment && doc_state == DocumentState::AfterRoot {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        visitor.entity_ref(entity)?
+                    }
                     Token::ControlChar(_) => {
                         return Err(Error {
                             span,
@@ -1305,6 +1398,17 @@ where
                             kind: ErrorKind::InvalidName,
                         });
                     }
+                    if path.is_empty() {
+                        if !fragment && doc_state == DocumentState::AfterRoot {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        if !fragment {
+                            doc_state = DocumentState::InRoot;
+                        }
+                    }
                     path.push(name)?;
                     visitor.open_tag(name)?;
                     state = State::StartTagExpectingAttrs;
@@ -1324,6 +1428,17 @@ where
                             span,
                             kind: ErrorKind::InvalidName,
                         });
+                    }
+                    if path.is_empty() {
+                        if !fragment && doc_state == DocumentState::AfterRoot {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        if !fragment {
+                            doc_state = DocumentState::InRoot;
+                        }
                     }
                     path.push(name)?;
                     visitor.open_tag(name)?;
@@ -1345,6 +1460,17 @@ where
                             span,
                             kind: ErrorKind::InvalidName,
                         });
+                    }
+                    if path.is_empty() {
+                        if !fragment && doc_state == DocumentState::AfterRoot {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
+                        if !fragment {
+                            doc_state = DocumentState::InRoot;
+                        }
                     }
                     path.push(name)?;
                     visitor.open_tag(name)?;
@@ -1379,7 +1505,9 @@ where
                     let name = path.last().unwrap();
                     visitor.close_open_tag(name, true)?;
                     path.pop();
-
+                    if !fragment && path.is_empty() {
+                        doc_state = DocumentState::AfterRoot;
+                    }
                     state = State::None;
                     continue;
                 } else {
@@ -1397,7 +1525,9 @@ where
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     visitor.end_close_tag(name)?;
                     path.pop();
-
+                    if !fragment && path.is_empty() {
+                        doc_state = DocumentState::AfterRoot;
+                    }
                     state = State::None;
                     continue;
                 } else {
@@ -1468,6 +1598,9 @@ where
                         visitor.start_close_tag(tag)?;
                         visitor.end_close_tag(tag)?;
                         path.pop();
+                        if !fragment && path.is_empty() {
+                            doc_state = DocumentState::AfterRoot;
+                        }
                         state = State::None;
                     } else {
                         return Err(Error {
@@ -1586,6 +1719,12 @@ where
             State::AttrExpectingValue(key, start_pos, quote_type) => {
                 if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
+                    if value.contains('<') {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidAttributeSyntax,
+                        });
+                    }
                     if key == "xmlns" {
                         if value == "http://www.w3.org/XML/1998/namespace"
                             || value == "http://www.w3.org/2000/xmlns/"
@@ -1624,7 +1763,17 @@ where
                             });
                         }
                     }
+                    if current_tag_attrs.contains(&key) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidAttributeSyntax,
+                        });
+                    }
                     visitor.attribute(key, value)?;
+                    current_tag_attrs.push(key).map_err(|_| Error {
+                        span,
+                        kind: ErrorKind::CapacityExceeded,
+                    })?;
                     state = State::StartTagExpectingAttrs;
                 } else {
                     state = State::AttrExpectingClosingQuote(key, start_pos, quote_type);
@@ -1653,6 +1802,12 @@ where
             State::AttrExpectingClosingQuote(key, start_pos, quote_type) => {
                 if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
+                    if value.contains('<') {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidAttributeSyntax,
+                        });
+                    }
                     if key == "xmlns" {
                         if value == "http://www.w3.org/XML/1998/namespace"
                             || value == "http://www.w3.org/2000/xmlns/"
@@ -1691,8 +1846,29 @@ where
                             });
                         }
                     }
+                    if current_tag_attrs.contains(&key) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidAttributeSyntax,
+                        });
+                    }
                     visitor.attribute(key, value)?;
+                    current_tag_attrs.push(key).map_err(|_| Error {
+                        span,
+                        kind: ErrorKind::CapacityExceeded,
+                    })?;
                     state = State::StartTagExpectingAttrs;
+                } else if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidAttributeSyntax,
+                    });
+                } else if matches!(token, Token::Eof) {
+                    panic!("WHWYYY");
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedEof,
+                    });
                 }
             }
             State::EntityRefExpectingValue(start_pos) => {
@@ -1715,6 +1891,7 @@ where
                     visitor.entity_ref(entity_name)?;
                     state = State::None;
                 } else if matches!(token, Token::Eof) {
+                    panic!("Die?");
                     return Err(Error {
                         span,
                         kind: ErrorKind::UnexpectedEof,
@@ -1771,6 +1948,7 @@ where
                         kind: ErrorKind::InvalidEntity,
                     });
                 } else if matches!(token, Token::Eof) {
+                    panic!("WHy");
                     return Err(Error {
                         span,
                         kind: ErrorKind::UnexpectedEof,

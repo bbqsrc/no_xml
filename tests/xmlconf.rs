@@ -1,7 +1,5 @@
-#![feature(str_from_utf16_endian)]
-
 use console::Style;
-use no_xml::{Error, Visitor, XmlWriter, stream_xml_events};
+use no_xml::{Error, Visitor, XmlWriter, stream_xml_events, stream_xml_events_fragment};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -9,6 +7,28 @@ use std::fmt::Write as _;
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+
+fn decode_utf16_be(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err("Invalid UTF-16 BE: odd number of bytes".to_string());
+    }
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&u16s).map_err(|e| e.to_string())
+}
+
+fn decode_utf16_le(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err("Invalid UTF-16 LE: odd number of bytes".to_string());
+    }
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&u16s).map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct Test {
@@ -340,9 +360,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let buf = std::fs::read(path)?;
         let content = match if buf.starts_with(&[0xFE, 0xFF]) {
-            String::from_utf16be(&buf).map_err(|e| e.to_string())
+            decode_utf16_be(&buf[2..])
         } else if buf.starts_with(&[0xFF, 0xFE]) {
-            String::from_utf16le(&buf).map_err(|e| e.to_string())
+            decode_utf16_le(&buf[2..])
         } else {
             String::from_utf8(buf).map_err(|e| e.to_string())
         } {
@@ -623,18 +643,13 @@ impl Visitor for TestFileVisitor {
 fn parse_test_file(path: &str) -> Result<Vec<Test>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let mut visitor = TestFileVisitor::new();
-    stream_xml_events::<Vec<&'_ str>>(&content, &mut visitor)
+    stream_xml_events_fragment::<Vec<&'_ str>>(&content, &mut visitor)
         .map_err(|e| format!("Error parsing {}: {}", path, e))?;
     Ok(visitor.into_tests())
 }
 
 fn run_test(test: &Test, base_path: &str, skip_output: bool) -> TestResult {
     let test_file_path = format!("{}{}", base_path, test.uri);
-
-    // Skip OUTPUT tests if flag is set
-    if test.output.is_some() && skip_output {
-        return TestResult::Skipped;
-    }
 
     // Try to parse the test file
     let buf = match std::fs::read(&test_file_path) {
@@ -651,9 +666,9 @@ fn run_test(test: &Test, base_path: &str, skip_output: bool) -> TestResult {
 
     // Check for LE and BE UTF-16 BOMs and convert to UTF-8
     let content = match if buf.starts_with(&[0xFE, 0xFF]) {
-        String::from_utf16be(&buf).map_err(|e| e.to_string())
+        decode_utf16_be(&buf[2..])
     } else if buf.starts_with(&[0xFF, 0xFE]) {
-        String::from_utf16le(&buf).map_err(|e| e.to_string())
+        decode_utf16_le(&buf[2..])
     } else {
         String::from_utf8(buf).map_err(|e| e.to_string())
     } {
@@ -669,7 +684,9 @@ fn run_test(test: &Test, base_path: &str, skip_output: bool) -> TestResult {
     };
 
     // Check if this is an OUTPUT test
-    if let Some(ref output_file) = test.output {
+    if let Some(ref output_file) = test.output
+        && !skip_output
+    {
         let mut writer = XmlWriter::with_source_path(&test_file_path);
         match stream_xml_events::<Vec<&'_ str>>(&content, &mut writer) {
             Ok(_) => {
