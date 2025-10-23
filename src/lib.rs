@@ -95,6 +95,7 @@ pub enum Delim {
     CDataEnd,
     CommentStart,
     CommentEnd,
+    DoubleDash,
     ProcessingInstructionStart,
     ProcessingInstructionEnd,
     Doctype,
@@ -111,6 +112,7 @@ impl Delim {
             Delim::CDataEnd => "]]>",
             Delim::CommentStart => "<!--",
             Delim::CommentEnd => "-->",
+            Delim::DoubleDash => "--",
             Delim::ProcessingInstructionStart => "<?",
             Delim::ProcessingInstructionEnd => "?>",
             Delim::Doctype => "<!DOCTYPE",
@@ -301,6 +303,7 @@ pub enum ErrorKind {
     DoctypeNestingTooDeep,
     CapacityExceeded,
     InsertFailed,
+    IllegalCharacter,
 }
 
 impl core::fmt::Display for ErrorKind {
@@ -318,6 +321,7 @@ impl core::fmt::Display for ErrorKind {
             ErrorKind::DoctypeNestingTooDeep => write!(f, "DOCTYPE nesting too deep"),
             ErrorKind::CapacityExceeded => write!(f, "Capacity exceeded"),
             ErrorKind::InsertFailed => write!(f, "Insert failed"),
+            ErrorKind::IllegalCharacter => write!(f, "Illegal character"),
         }
     }
 }
@@ -748,6 +752,12 @@ fn delim<'t, T: NonStandardToken>(base_buf: Cursor<'t, T>) -> (Maybe<Delim>, Cur
         _ => {}
     }
 
+    // Check for -- after ruling out -->
+    let cur = buf.peek_substr(2);
+    if cur == "--" {
+        return (Some(buf.consume_with_span(Delim::DoubleDash)), buf);
+    }
+
     (None, base_buf)
 }
 
@@ -758,9 +768,6 @@ where
     if !buf.is_empty() {
         if let Some(chs) = buf.peek_next_char_str() {
             let ch = chs.chars().next().unwrap();
-            if ch == '\u{FEFF}' {
-                panic!("BOM");
-            }
 
             if WhiteSpace::try_from(ch).is_ok()
                 || Punc::try_from(chs).is_ok()
@@ -883,6 +890,12 @@ enum DocumentState {
     AfterRoot,
 }
 
+impl DocumentState {
+    fn is_entity_ref_allowed(&self) -> bool {
+        matches!(self, DocumentState::InDoctype(_) | DocumentState::InRoot)
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum EntityDeclType {
     Internal,
@@ -983,24 +996,25 @@ pub trait Visitor {
     }
 }
 
-fn validate_numeric_char_ref(entity_value: &str) -> bool {
+fn numeric_char_ref(entity_value: &str) -> Result<Option<char>, ErrorKind> {
     let Some(value_str) = entity_value.strip_prefix('#') else {
-        return false;
+        return Ok(None);
     };
 
-    let codepoint = if let Some(hex_str) = value_str.strip_prefix('x') {
-        match u32::from_str_radix(hex_str, 16) {
-            Ok(val) => val,
-            Err(_) => return false,
-        }
+    let (value_str, str_radix) = if let Some(hex_str) = value_str.strip_prefix('x') {
+        (hex_str, 16)
     } else {
-        match value_str.parse::<u32>() {
-            Ok(val) => val,
-            Err(_) => return false,
-        }
+        (value_str, 10)
     };
 
-    codepoint <= 0x10FFFF
+    let val = u32::from_str_radix(value_str, str_radix).map_err(|_| ErrorKind::InvalidEntity)?;
+    let codepoint = char::from_u32(val).ok_or_else(|| ErrorKind::InvalidEntity)?;
+
+    if codepoint.is_control() {
+        return Err(ErrorKind::IllegalCharacter);
+    }
+
+    Ok(Some(codepoint))
 }
 
 fn is_name_start_char(c: char) -> bool {
@@ -1195,13 +1209,14 @@ where
                 continue;
             }
 
+            if matches!(token, Token::Delim(Delim::DoubleDash)) {
+                return Err(Error {
+                    span,
+                    kind: ErrorKind::UnexpectedToken,
+                });
+            }
+
             if let Some(text) = token.to_text() {
-                if text.contains("--") {
-                    return Err(Error {
-                        span,
-                        kind: ErrorKind::UnexpectedToken,
-                    });
-                }
                 visitor.comment(text)?;
             } else {
                 return Err(Error {
@@ -1276,8 +1291,13 @@ where
                             kind: ErrorKind::UnexpectedToken,
                         });
                     }
+                    Token::ControlChar(_) => {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::UnexpectedToken,
+                        });
+                    }
                     Token::Eof => {
-                        panic!("HI");
                         return Err(Error {
                             span,
                             kind: ErrorKind::UnexpectedEof,
@@ -1864,7 +1884,6 @@ where
                         kind: ErrorKind::InvalidAttributeSyntax,
                     });
                 } else if matches!(token, Token::Eof) {
-                    panic!("WHWYYY");
                     return Err(Error {
                         span,
                         kind: ErrorKind::UnexpectedEof,
@@ -1888,10 +1907,15 @@ where
                             kind: ErrorKind::InvalidEntity,
                         });
                     }
+                    if !fragment && !doc_state.is_entity_ref_allowed() {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::UnexpectedToken,
+                        });
+                    }
                     visitor.entity_ref(entity_name)?;
                     state = State::None;
                 } else if matches!(token, Token::Eof) {
-                    panic!("Die?");
                     return Err(Error {
                         span,
                         kind: ErrorKind::UnexpectedEof,
@@ -1901,14 +1925,30 @@ where
                 }
             }
             State::EntityRefExpectingNumerals(start_pos) => {
+                if !fragment && !doc_state.is_entity_ref_allowed() {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedToken,
+                    });
+                }
+
                 if matches!(token, Token::Punc(Punc::Semicolon)) {
+                    let mut buf = [0; 4];
                     let entity_value = &input[start_pos.index..span.start.index];
-                    if !validate_numeric_char_ref(entity_value) {
-                        return Err(Error {
-                            span,
-                            kind: ErrorKind::InvalidEntity,
-                        });
-                    }
+                    let entity_value = match numeric_char_ref(entity_value) {
+                        Ok(None) => entity_value,
+                        Ok(Some(v)) => {
+                            let s = v.encode_utf8(&mut buf);
+                            s
+                        },
+                        Err(kind) => {
+                            return Err(Error {
+                                span,
+                                kind,
+                            });
+                        }
+                    };
+
                     visitor.entity_ref(entity_value)?;
                     state = State::None;
                 } else if matches!(token, Token::Eof) {
@@ -1923,23 +1963,30 @@ where
             State::EntityRefExpectingSemicolon(start_pos) => {
                 if matches!(token, Token::Punc(Punc::Semicolon)) {
                     let entity_name = &input[start_pos.index..span.start.index];
-                    if entity_name.starts_with('#') {
-                        if !validate_numeric_char_ref(entity_name) {
-                            return Err(Error {
-                                span,
-                                kind: ErrorKind::InvalidEntity,
-                            });
-                        }
-                    } else {
-                        if entity_name.is_empty()
-                            || !entity_name.chars().next().map_or(false, is_name_start_char)
-                        {
-                            return Err(Error {
-                                span,
-                                kind: ErrorKind::InvalidEntity,
-                            });
-                        }
-                    }
+                    
+                    // if entity_name.starts_with('#') {
+                    //     if !validate_numeric_char_ref(entity_name) {
+                    //         return Err(Error {
+                    //             span,
+                    //             kind: ErrorKind::InvalidEntity,
+                    //         });
+                    //     }
+                    // } else {
+                    //     if entity_name.is_empty()
+                    //         || !entity_name.chars().next().map_or(false, is_name_start_char)
+                    //     {
+                    //         return Err(Error {
+                    //             span,
+                    //             kind: ErrorKind::InvalidEntity,
+                    //         });
+                    //     }
+                    // }
+                    // if !fragment && !doc_state.is_entity_ref_allowed() {
+                    //     return Err(Error {
+                    //         span,
+                    //         kind: ErrorKind::UnexpectedToken,
+                    //     });
+                    // }
                     visitor.entity_ref(entity_name)?;
                     state = State::None;
                 } else if matches!(token, Token::WhiteSpace(_)) {
@@ -1948,7 +1995,6 @@ where
                         kind: ErrorKind::InvalidEntity,
                     });
                 } else if matches!(token, Token::Eof) {
-                    panic!("WHy");
                     return Err(Error {
                         span,
                         kind: ErrorKind::UnexpectedEof,
