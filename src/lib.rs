@@ -3,6 +3,9 @@
 #[cfg(feature = "jsx")]
 pub mod jsx;
 
+pub mod writer;
+pub use writer::XmlWriter;
+
 use core::{
     fmt::{Debug, Display},
     iter::Peekable,
@@ -12,7 +15,6 @@ use core::{
 };
 
 use collections2::ListMut;
-use heapless::index_map::Values;
 
 const MAX_DOCTYPE_DEPTH: u8 = 6;
 
@@ -199,6 +201,7 @@ where
     Text(&'t str),
     WhiteSpace(WhiteSpace),
     EntityRef(&'t str),
+    ControlChar(char),
 }
 
 impl<'t, T> Token<'t, T>
@@ -213,19 +216,20 @@ where
             Token::EntityRef(e) => Some(*e),
             Token::Delim(delim) => Some(delim.as_str()),
             Token::NonStandard(_) => None,
+            Token::ControlChar(_) => None,
             Token::Eof => None,
         }
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct Position {
     pub index: usize,
     pub line: usize,
     pub col: usize,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub struct Span {
     pub start: Position,
     pub end: Position,
@@ -270,6 +274,19 @@ pub struct Error {
     pub kind: ErrorKind,
 }
 
+impl<T> From<collections2::Error<T>> for Error {
+    fn from(value: collections2::Error<T>) -> Self {
+        let kind = match value {
+            collections2::Error::CapacityExceeded => ErrorKind::CapacityExceeded,
+            collections2::Error::InsertFailed(_) => ErrorKind::InsertFailed,
+        };
+        Error {
+            span: Span::default(),
+            kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorKind {
     UnexpectedEof,
@@ -277,10 +294,13 @@ pub enum ErrorKind {
     InvalidClosingTag,
     InvalidAttributeSyntax,
     InvalidEntity,
+    InvalidName,
     UnexpectedToken,
     TagNameExpected,
     UnimplementedFeature,
     DoctypeNestingTooDeep,
+    CapacityExceeded,
+    InsertFailed,
 }
 
 impl core::fmt::Display for ErrorKind {
@@ -291,10 +311,13 @@ impl core::fmt::Display for ErrorKind {
             ErrorKind::InvalidClosingTag => write!(f, "Invalid closing tag"),
             ErrorKind::InvalidAttributeSyntax => write!(f, "Invalid attribute syntax"),
             ErrorKind::InvalidEntity => write!(f, "Invalid entity"),
+            ErrorKind::InvalidName => write!(f, "Invalid name"),
             ErrorKind::UnexpectedToken => write!(f, "Unexpected token"),
             ErrorKind::TagNameExpected => write!(f, "Tag name expected"),
             ErrorKind::UnimplementedFeature => write!(f, "Unimplemented feature"),
             ErrorKind::DoctypeNestingTooDeep => write!(f, "DOCTYPE nesting too deep"),
+            ErrorKind::CapacityExceeded => write!(f, "Capacity exceeded"),
+            ErrorKind::InsertFailed => write!(f, "Insert failed"),
         }
     }
 }
@@ -503,13 +526,23 @@ where
 pub struct XmlVisitor;
 
 impl Visitor for XmlVisitor {
-    fn start_tag(&mut self, name: &str) -> Result<(), Error> {
-        debug!("Start: {}", name);
+    fn open_tag(&mut self, name: &str) -> Result<(), Error> {
+        debug!("Open: {}", name);
         Ok(())
     }
 
-    fn end_tag(&mut self, name: &str) -> Result<(), Error> {
-        debug!("End: {name}");
+    fn close_open_tag(&mut self, name: &str, self_closing: bool) -> Result<(), Error> {
+        debug!("Close open tag: {} (self_closing: {})", name, self_closing);
+        Ok(())
+    }
+
+    fn start_close_tag(&mut self, name: &str) -> Result<(), Error> {
+        debug!("Start close: {name}");
+        Ok(())
+    }
+
+    fn end_close_tag(&mut self, name: &str) -> Result<(), Error> {
+        debug!("End close tag: {name}");
         Ok(())
     }
 
@@ -578,8 +611,8 @@ impl Visitor for XmlVisitor {
         Ok(())
     }
 
-    fn start_entity_declaration(&mut self) -> Result<(), Error> {
-        debug!("Start ENTITY");
+    fn start_entity_declaration(&mut self, decl_type: EntityDeclType) -> Result<(), Error> {
+        debug!("Start ENTITY {:?}", decl_type);
         Ok(())
     }
     fn entity_declaration(&mut self, content: &str) -> Result<(), Error> {
@@ -615,7 +648,7 @@ impl<'t, T: NonStandardToken> Iterator for Iter<'t, T> {
             return None;
         };
 
-        match tokenize::<T>(cursor, StateMode::None) {
+        match tokenize::<T>(cursor) {
             Err(_) | Ok((_, Token::Eof, _)) => None,
             Ok(tup) => Some(tup),
         }
@@ -674,10 +707,7 @@ fn delim_directive<'t, T: NonStandardToken>(
     return (None, base_buf);
 }
 
-fn delim<'t, T: NonStandardToken>(
-    base_buf: Cursor<'t, T>,
-    state_mode: StateMode,
-) -> (Maybe<Delim>, Cursor<'t, T>) {
+fn delim<'t, T: NonStandardToken>(base_buf: Cursor<'t, T>) -> (Maybe<Delim>, Cursor<'t, T>) {
     let mut buf = base_buf.clone();
     buf.buffer_chars_up_to(2);
     let cur = buf.peek_substr(2);
@@ -704,21 +734,14 @@ fn delim<'t, T: NonStandardToken>(
 
     match cur {
         "-->" => return (Some(buf.consume_with_span(Delim::CommentEnd)), buf),
-        // This is hacky, the tokenizer shouldn't need to be stateful
-        "]]>" if matches!(state_mode, StateMode::CData) => {
-            return (Some(buf.consume_with_span(Delim::CDataEnd)), buf);
-        }
-
+        "]]>" => return (Some(buf.consume_with_span(Delim::CDataEnd)), buf),
         _ => {}
     }
 
     (None, base_buf)
 }
 
-fn tokenize<'t, T>(
-    mut buf: Cursor<'t, T>,
-    state_mode: StateMode,
-) -> Result<(Span, Token<'t, T>, Cursor<'t, T>), Error>
+fn tokenize<'t, T>(mut buf: Cursor<'t, T>) -> Result<(Span, Token<'t, T>, Cursor<'t, T>), Error>
 where
     T: NonStandardToken,
 {
@@ -757,7 +780,7 @@ where
         return Ok((span, Token::WhiteSpace(ws), buf));
     }
 
-    let (delim, mut buf) = delim(buf, state_mode);
+    let (delim, mut buf) = delim(buf);
     if let Some((span, delim)) = delim {
         return Ok((span, Token::Delim(delim), buf));
     }
@@ -772,7 +795,12 @@ where
         return Ok((span, Token::NonStandard(non_standard), buf));
     }
 
-    tokenize(buf, state_mode)
+    if ch.is_control() {
+        let span = buf.consume();
+        return Ok((span, Token::ControlChar(ch), buf));
+    }
+
+    tokenize(buf)
 }
 
 pub enum Event<'e> {
@@ -818,8 +846,10 @@ where
     EntityDeclNDataExpectingName,
     EntityDeclExpectingGt,
     ElementDeclExpectingContent,
+    NotationDeclExpectingName,
     NotationDeclExpectingContent,
     AttlistDeclExpectingContent,
+    ProcessingInstructionName,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -830,6 +860,12 @@ pub enum StateMode {
     ProcessingInstruction,
     Doctype,
     DoctypeInner(u8),
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum EntityDeclType {
+    Internal,
+    Parameter,
 }
 
 pub trait Parser<V: Visitor>: Default {
@@ -858,10 +894,16 @@ impl<V: Visitor> Parser<V> for XmlParser {
 }
 
 pub trait Visitor {
-    fn start_tag(&mut self, _name: &str) -> Result<(), Error> {
+    fn open_tag(&mut self, _name: &str) -> Result<(), Error> {
         Ok(())
     }
-    fn end_tag(&mut self, _name: &str) -> Result<(), Error> {
+    fn close_open_tag(&mut self, _name: &str, _self_closing: bool) -> Result<(), Error> {
+        Ok(())
+    }
+    fn start_close_tag(&mut self, _name: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_close_tag(&mut self, _name: &str) -> Result<(), Error> {
         Ok(())
     }
     fn attribute(&mut self, _key: &str, _value: &str) -> Result<(), Error> {
@@ -900,7 +942,7 @@ pub trait Visitor {
     fn end_doctype(&mut self) -> Result<(), Error> {
         Ok(())
     }
-    fn start_entity_declaration(&mut self) -> Result<(), Error> {
+    fn start_entity_declaration(&mut self, _decl_type: EntityDeclType) -> Result<(), Error> {
         Ok(())
     }
     fn end_entity_declaration(&mut self) -> Result<(), Error> {
@@ -917,6 +959,76 @@ pub trait Visitor {
     }
     fn element_declaration(&mut self, _content: &str) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+fn validate_numeric_char_ref(entity_value: &str) -> bool {
+    let Some(value_str) = entity_value.strip_prefix('#') else {
+        return false;
+    };
+
+    let codepoint = if let Some(hex_str) = value_str.strip_prefix('x') {
+        match u32::from_str_radix(hex_str, 16) {
+            Ok(val) => val,
+            Err(_) => return false,
+        }
+    } else {
+        match value_str.parse::<u32>() {
+            Ok(val) => val,
+            Err(_) => return false,
+        }
+    };
+
+    codepoint <= 0x10FFFF
+}
+
+fn is_name_start_char(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z' |
+        '\u{C0}'..='\u{D6}' |
+        '\u{D8}'..='\u{F6}' |
+        '\u{F8}'..='\u{2FF}' |
+        '\u{370}'..='\u{37D}' |
+        '\u{37F}'..='\u{1FFF}' |
+        '\u{200C}'..='\u{200D}' |
+        '\u{2070}'..='\u{218F}' |
+        '\u{2C00}'..='\u{2FEF}' |
+        '\u{3001}'..='\u{D7FF}' |
+        '\u{F900}'..='\u{FDCF}' |
+        '\u{FDF0}'..='\u{FFFD}' |
+        '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+fn is_name_char(c: char) -> bool {
+    is_name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' |
+            '\u{B7}' |
+            '\u{0300}'..='\u{036F}' |
+            '\u{203F}'..='\u{2040}'
+        )
+}
+
+fn validate_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !is_name_start_char(first) {
+        return false;
+    }
+
+    chars.all(is_name_char)
+}
+
+fn has_xmlns_prefix(name: &str) -> bool {
+    if let Some(colon_pos) = name.find(':') {
+        &name[..colon_pos] == "xmlns"
+    } else {
+        false
     }
 }
 
@@ -940,7 +1052,7 @@ where
     let mut parser = P::default();
 
     loop {
-        let (span, token, b) = tokenize(buf, state_mode)?;
+        let (span, token, b) = tokenize(buf)?;
         buf = b;
 
         if matches!(token, Token::Eof) {
@@ -963,11 +1075,8 @@ where
             }
 
             if matches!(token, Token::Punc(Punc::LeftSquareBracket)) {
+                visitor.doctype("[")?;
                 state_mode = StateMode::DoctypeInner(0);
-                continue;
-            }
-
-            if matches!(token, Token::WhiteSpace(_)) {
                 continue;
             }
 
@@ -986,6 +1095,7 @@ where
         if let StateMode::DoctypeInner(depth) = state_mode {
             if matches!(token, Token::Punc(Punc::RightSquareBracket)) {
                 if depth == 0 {
+                    visitor.doctype("]")?;
                     state_mode = StateMode::Doctype;
                 } else {
                     state_mode = StateMode::DoctypeInner(depth - 1);
@@ -1027,6 +1137,12 @@ where
             }
 
             if let Some(text) = token.to_text() {
+                if text.contains("--") {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedToken,
+                    });
+                }
                 visitor.comment(text)?;
             } else {
                 return Err(Error {
@@ -1040,12 +1156,28 @@ where
 
         if matches!(state_mode, StateMode::ProcessingInstruction) {
             if let Token::Delim(Delim::ProcessingInstructionEnd) = token {
+                if matches!(state, State::ProcessingInstructionName) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::TagNameExpected,
+                    });
+                }
                 visitor.end_processing_instruction()?;
                 state_mode = StateMode::None;
+                state = State::None;
                 continue;
             }
 
             if let Some(text) = token.to_text() {
+                if matches!(state, State::ProcessingInstructionName) {
+                    if text.contains(':') {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    state = State::None;
+                }
                 visitor.processing_instruction(text)?;
             } else {
                 return Err(Error {
@@ -1066,7 +1198,7 @@ where
                 }
 
                 if matches!(token, Token::Punc(Punc::TagStart)) {
-                    let (_, token2, _) = tokenize(buf.clone(), state_mode)?;
+                    let (_, token2, _) = tokenize(buf.clone())?;
 
                     if matches!(token2, Token::Punc(Punc::Slash)) {
                         state = State::EndTagExpectingName;
@@ -1103,6 +1235,7 @@ where
                         }
                         Delim::ProcessingInstructionStart => {
                             state_mode = StateMode::ProcessingInstruction;
+                            state = State::ProcessingInstructionName;
                             visitor.start_processing_instruction()?;
                             continue;
                         }
@@ -1121,18 +1254,30 @@ where
                             continue;
                         }
                         Delim::Notation => {
-                            state = State::NotationDeclExpectingContent;
+                            state = State::NotationDeclExpectingName;
                             continue;
                         }
                         Delim::Attlist => {
                             state = State::AttlistDeclExpectingContent;
                             continue;
                         }
+                        Delim::CDataEnd => {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::UnexpectedToken,
+                            });
+                        }
                         _ => {}
                     },
                     Token::Text(text) => visitor.text(text)?,
                     Token::WhiteSpace(ws) => visitor.text(ws.as_str())?,
                     Token::EntityRef(entity) => visitor.entity_ref(entity)?,
+                    Token::ControlChar(_) => {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::UnexpectedToken,
+                        });
+                    }
                 }
 
                 continue;
@@ -1148,24 +1293,61 @@ where
                 // Stop on whitespace, /, >, or text (which would be an attribute name)
                 if matches!(token, Token::WhiteSpace(_)) {
                     let name = &input[start_pos.index..span.start.index];
-                    path.push(name);
-                    visitor.start_tag(name)?;
+                    if !validate_xml_name(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    if has_xmlns_prefix(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    path.push(name)?;
+                    visitor.open_tag(name)?;
                     state = State::StartTagExpectingAttrs;
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     let name = &input[start_pos.index..span.start.index];
-                    path.push(name);
-                    visitor.start_tag(name)?;
+                    if !validate_xml_name(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    if has_xmlns_prefix(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    path.push(name)?;
+                    visitor.open_tag(name)?;
+                    visitor.close_open_tag(name, false)?;
                     state = State::None;
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::Slash)) {
                     let name = &input[start_pos.index..span.start.index];
-                    path.push(name);
-                    visitor.start_tag(name)?;
+                    if !validate_xml_name(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    if has_xmlns_prefix(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+                    path.push(name)?;
+                    visitor.open_tag(name)?;
                     state = State::StartTagExpectingGt;
                     continue;
                 }
@@ -1183,6 +1365,8 @@ where
                 }
 
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    let name = path.last().unwrap();
+                    visitor.close_open_tag(name, false)?;
                     state = State::None;
                     continue;
                 }
@@ -1192,12 +1376,9 @@ where
             }
             State::StartTagExpectingGt => {
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
-                    // if !path.contains(&"TESTCASES") {
-                    //     println!("POP GT {:?}", path);
-                    // }
-                    let name = path.pop().unwrap();
-
-                    visitor.end_tag(name)?;
+                    let name = path.last().unwrap();
+                    visitor.close_open_tag(name, true)?;
+                    path.pop();
 
                     state = State::None;
                     continue;
@@ -1214,7 +1395,8 @@ where
                 }
 
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
-                    visitor.end_tag(name)?;
+                    visitor.end_close_tag(name)?;
+                    path.pop();
 
                     state = State::None;
                     continue;
@@ -1236,15 +1418,24 @@ where
                 // Stop on whitespace or >
                 if matches!(token, Token::WhiteSpace(_)) {
                     let name = &input[start_pos.index..span.start.index];
+                    let tag_name = &name[1..].trim();
 
-                    if let Some(tag) = path.pop() {
-                        if tag != name[1..].trim() {
+                    if !validate_xml_name(tag_name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+
+                    if let Some(tag) = path.last() {
+                        if *tag != *tag_name {
                             return Err(Error {
                                 span,
                                 kind: ErrorKind::MismatchedTag,
                             });
                         }
 
+                        visitor.start_close_tag(tag)?;
                         state = State::EndTagExpectingGt(tag);
                     } else {
                         return Err(Error {
@@ -1257,16 +1448,26 @@ where
 
                 if matches!(token, Token::Punc(Punc::TagEnd)) {
                     let name = &input[start_pos.index..span.start.index];
+                    let tag_name = &name[1..].trim();
 
-                    if let Some(tag) = path.pop() {
-                        if tag != name[1..].trim() {
+                    if !validate_xml_name(tag_name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
+
+                    if let Some(tag) = path.last() {
+                        if *tag != *tag_name {
                             return Err(Error {
                                 span,
                                 kind: ErrorKind::MismatchedTag,
                             });
                         }
 
-                        visitor.end_tag(tag)?;
+                        visitor.start_close_tag(tag)?;
+                        visitor.end_close_tag(tag)?;
+                        path.pop();
                         state = State::None;
                     } else {
                         return Err(Error {
@@ -1283,18 +1484,36 @@ where
                 // Stop on whitespace, =, :, /, or >
                 if matches!(token, Token::WhiteSpace(_)) {
                     let name = &input[start_pos.index..span.start.index];
+                    if !validate_xml_name(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
                     state = State::AttrExpectingEqOrNamespace(name, start_pos);
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::Equals)) {
                     let name = &input[start_pos.index..span.start.index];
+                    if !validate_xml_name(name) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
                     state = State::AttrExpectingOpeningQuote(name);
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::Colon)) {
                     let prefix = &input[start_pos.index..span.start.index];
+                    if !validate_xml_name(prefix) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidName,
+                        });
+                    }
                     state = State::AttrExpectingNamespaceLocalName(prefix, start_pos);
                     continue;
                 }
@@ -1327,12 +1546,30 @@ where
                 // Stop on whitespace, =, /, or >
                 if matches!(token, Token::WhiteSpace(_)) {
                     let full_name = &input[prefix_start.index..span.start.index];
+                    if let Some(colon_pos) = full_name.find(':') {
+                        let local_name = &full_name[colon_pos + 1..];
+                        if !validate_xml_name(local_name) {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidName,
+                            });
+                        }
+                    }
                     state = State::AttrExpectingEqOrNamespace(full_name, prefix_start);
                     continue;
                 }
 
                 if matches!(token, Token::Punc(Punc::Equals)) {
                     let full_name = &input[prefix_start.index..span.start.index];
+                    if let Some(colon_pos) = full_name.find(':') {
+                        let local_name = &full_name[colon_pos + 1..];
+                        if !validate_xml_name(local_name) {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidName,
+                            });
+                        }
+                    }
                     state = State::AttrExpectingOpeningQuote(full_name);
                     continue;
                 }
@@ -1349,6 +1586,44 @@ where
             State::AttrExpectingValue(key, start_pos, quote_type) => {
                 if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
+                    if key == "xmlns" {
+                        if value == "http://www.w3.org/XML/1998/namespace"
+                            || value == "http://www.w3.org/2000/xmlns/"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                    }
+                    if let Some(xmlns_prefix) = key.strip_prefix("xmlns:") {
+                        if xmlns_prefix == "xmlns" {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidName,
+                            });
+                        }
+                        if xmlns_prefix == "xml" && value != "http://www.w3.org/XML/1998/namespace"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                        if value == "http://www.w3.org/XML/1998/namespace" && xmlns_prefix != "xml"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                        if value == "http://www.w3.org/2000/xmlns/" {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                    }
                     visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
                 } else {
@@ -1378,6 +1653,44 @@ where
             State::AttrExpectingClosingQuote(key, start_pos, quote_type) => {
                 if matches!(token, Token::Punc(q) if q == quote_type) {
                     let value = &input[start_pos.index..span.start.index];
+                    if key == "xmlns" {
+                        if value == "http://www.w3.org/XML/1998/namespace"
+                            || value == "http://www.w3.org/2000/xmlns/"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                    }
+                    if let Some(xmlns_prefix) = key.strip_prefix("xmlns:") {
+                        if xmlns_prefix == "xmlns" {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidName,
+                            });
+                        }
+                        if xmlns_prefix == "xml" && value != "http://www.w3.org/XML/1998/namespace"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                        if value == "http://www.w3.org/XML/1998/namespace" && xmlns_prefix != "xml"
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                        if value == "http://www.w3.org/2000/xmlns/" {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidAttributeSyntax,
+                            });
+                        }
+                    }
                     visitor.attribute(key, value)?;
                     state = State::StartTagExpectingAttrs;
                 }
@@ -1387,6 +1700,18 @@ where
                     state = State::EntityRefExpectingNumerals(start_pos);
                 } else if matches!(token, Token::Punc(Punc::Semicolon)) {
                     let entity_name = &input[start_pos.index..span.start.index];
+                    if entity_name.is_empty() {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidEntity,
+                        });
+                    }
+                    if !entity_name.chars().next().map_or(false, is_name_start_char) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidEntity,
+                        });
+                    }
                     visitor.entity_ref(entity_name)?;
                     state = State::None;
                 } else if matches!(token, Token::Eof) {
@@ -1401,6 +1726,12 @@ where
             State::EntityRefExpectingNumerals(start_pos) => {
                 if matches!(token, Token::Punc(Punc::Semicolon)) {
                     let entity_value = &input[start_pos.index..span.start.index];
+                    if !validate_numeric_char_ref(entity_value) {
+                        return Err(Error {
+                            span,
+                            kind: ErrorKind::InvalidEntity,
+                        });
+                    }
                     visitor.entity_ref(entity_value)?;
                     state = State::None;
                 } else if matches!(token, Token::Eof) {
@@ -1415,8 +1746,35 @@ where
             State::EntityRefExpectingSemicolon(start_pos) => {
                 if matches!(token, Token::Punc(Punc::Semicolon)) {
                     let entity_name = &input[start_pos.index..span.start.index];
+                    if entity_name.starts_with('#') {
+                        if !validate_numeric_char_ref(entity_name) {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidEntity,
+                            });
+                        }
+                    } else {
+                        if entity_name.is_empty()
+                            || !entity_name.chars().next().map_or(false, is_name_start_char)
+                        {
+                            return Err(Error {
+                                span,
+                                kind: ErrorKind::InvalidEntity,
+                            });
+                        }
+                    }
                     visitor.entity_ref(entity_name)?;
                     state = State::None;
+                } else if matches!(token, Token::WhiteSpace(_)) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::InvalidEntity,
+                    });
+                } else if matches!(token, Token::Eof) {
+                    return Err(Error {
+                        span,
+                        kind: ErrorKind::UnexpectedEof,
+                    });
                 }
             }
             State::EntityDeclExpectingOptionalPercent => {
@@ -1425,11 +1783,12 @@ where
                 }
 
                 if matches!(token, Token::Punc(Punc::Percent)) {
+                    visitor.start_entity_declaration(EntityDeclType::Parameter)?;
                     state = State::PEDeclExpectingContent;
                     continue;
                 }
 
-                visitor.start_entity_declaration()?;
+                visitor.start_entity_declaration(EntityDeclType::Internal)?;
                 state = State::EntityDeclNameContent(span.start);
             }
             State::PEDeclExpectingContent => {
@@ -1441,6 +1800,8 @@ where
                     state = State::None;
                     continue;
                 }
+
+                state = State::EntityDeclNameContent(span.start);
             }
             State::EntityDeclNameContent(start_pos) => {
                 if matches!(token, Token::WhiteSpace(_)) {
@@ -1638,6 +1999,21 @@ where
                     continue;
                 }
             }
+            State::NotationDeclExpectingName => {
+                if matches!(token, Token::WhiteSpace(_)) {
+                    continue;
+                }
+
+                if let Some(_text) = token.to_text() {
+                    state = State::NotationDeclExpectingContent;
+                    continue;
+                }
+
+                if matches!(token, Token::Punc(Punc::TagEnd)) {
+                    state = State::None;
+                    continue;
+                }
+            }
             State::NotationDeclExpectingContent => {
                 if matches!(token, Token::WhiteSpace(_)) {
                     continue;
@@ -1658,6 +2034,9 @@ where
                     continue;
                 }
             }
+            State::ProcessingInstructionName => {
+                // Handled in ProcessingInstruction mode above
+            }
         }
     }
 
@@ -1670,7 +2049,7 @@ type Vec<T> = heapless::Vec<T, 256>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cursor, stream_events};
+    use crate::Cursor;
 
     #[test]
     fn test() {

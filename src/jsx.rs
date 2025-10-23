@@ -35,13 +35,23 @@ impl JsxVisitor {
 }
 
 impl Visitor for JsxVisitor {
-    fn start_tag(&mut self, name: &str) -> Result<(), Error> {
+    fn open_tag(&mut self, name: &str) -> Result<(), Error> {
         println!("Start: {}", name);
         Ok(())
     }
 
-    fn end_tag(&mut self, name: &str) -> Result<(), Error> {
+    fn close_open_tag(&mut self, name: &str, self_closing: bool) -> Result<(), Error> {
+        println!("Close open: {} (self_closing: {})", name, self_closing);
+        Ok(())
+    }
+
+    fn start_close_tag(&mut self, name: &str) -> Result<(), Error> {
         println!("End: {name}");
+        Ok(())
+    }
+
+    fn end_close_tag(&mut self, name: &str) -> Result<(), Error> {
+        println!("End close: {name}");
         Ok(())
     }
 
@@ -70,7 +80,7 @@ impl Visitor for JsxVisitor {
         Ok(())
     }
 
-    fn entity(&mut self, entity: &str) -> Result<(), Error> {
+    fn entity_ref(&mut self, entity: &str) -> Result<(), Error> {
         println!("Entity: {:?}", entity);
         Ok(())
     }
